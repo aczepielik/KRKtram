@@ -32,7 +32,7 @@ vehicles:
     x1
      longitude
   latitudeas
-  heding
+  heading
   
 2. Odjazdy z konkretnego przystanku:
 http://www.ttss.krakow.pl/internetservice/services/passageInfo/stopPassages/stop?stop=STOPID
