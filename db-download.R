@@ -11,6 +11,8 @@ stop_names <- stop_names[[1]]
 
 stop_names <- stop_names[c('name', 'shortName', 'latitude', 'longitude')]
 stop_names$shortName <- as.numeric(stop_names$shortName)
+stop_names$latitude <- stop_names$latitude/3600000
+stop_names$longitude <- stop_names$longitude/3600000
 
 saveRDS(stop_names, 'stop-name-db.RDS')
 
@@ -44,11 +46,15 @@ linestops <- lapply(linestops, unique)
 for(i in seq_along(linestops)){
   linestops[[i]]$seq_num <- seq(dim(linestops[[i]])[1])
   linestops[[i]]$number <- rep(lines[ceiling(i/2)], dim(linestops[[i]])[1])
-  linestops[[i]]$directions <- unlist(rep(tail(linestops[[i]][1], 1), dim(linestops[[i]])[1]))
+  linestops[[i]]$direction <- unlist(rep(tail(linestops[[i]][1], 1), dim(linestops[[i]])[1]))
   
-  names(linestops[[i]]) <- c('name', 'seq_num', 'number', 'directions')
+  names(linestops[[i]]) <- c('name', 'seq_num', 'number', 'direction')
 }
 
 linestops <- do.call(rbind, linestops)
+
+linestops$direction <- gsub('Wzgórza Krzesławickie', 'Wzgórza K.', linestops$direction)
+linestops$direction <- gsub('Cmentarz Rakowicki', 'Cm. Rakowicki', linestops$direction)
+linestops$direction <- gsub('Dworzec Towarowy', 'Dworzec Tow.', linestops$direction)
 
 saveRDS(linestops, 'linestops.RDS')
