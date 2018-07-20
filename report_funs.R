@@ -52,18 +52,12 @@ stop_report <- function(stop_id){
 
 many_stops <- function(stops){ #takes about 20 sec
   city <- lapply(stops, stop_report)
-  do.call(rbind, city)
-  Sys.sleep(2)
+  Sys.sleep(1)
+  bind_rows(city)
 }
 
-to_save <- function(row, df){
-  df %>% 
-    filter(index > as.numeric(row[1]) & # Check for duplicated record with bigger index
-             stop == as.numeric(row[3]) & 
-             number == as.numeric(row[4]) &
-             direction == as.character(row[5]) & 
-             tripId == as.character(row[8])) %>% 
-    nrow() %>% `-`(1, .) %>% as.logical() #returns TRUE iff there are no duplicated records
+to_remove <- function(report){
+  report %>% select(stop, plannedTime, tripId) %>% duplicated.data.frame(fromLast = TRUE)
 }
 
 report_completion <- function(report){
@@ -110,7 +104,7 @@ periodic_report <- function(end, stops = stop_names$shortName){
     report <- report_tmp %>% cbind(index = i, .) %>% bind_rows(report, .)
     
     if(Sys.time() > saving_times[save_index]){# Cleraing report variable and writing it to external file
-      report <- report[apply(report, 1, to_save, report), ]
+      report <- report[!to_remove(report), ] #cleaning from duplicates
       write.table(report, 'report_tmp.csv', sep = ',', row.names = FALSE, 
                   col.names = first_dump, fileEncoding = 'UTF-8', append = !first_dump)
       
@@ -135,7 +129,7 @@ periodic_report <- function(end, stops = stop_names$shortName){
     status = col_character()
   )) %>% unique()
   
-  report_final <- report_final[apply(report_final, 1, to_save, report_final), ] #Final clering
+  report_final <- report_final[!to_remove(report_final), ] #Final clering
   
   report_completion(report_final) %>% 
   write.csv(report, 'report.csv', row.names = FALSE, fileEncoding = 'UTF-8')
