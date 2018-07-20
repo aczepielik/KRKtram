@@ -8,7 +8,7 @@ suppressPackageStartupMessages(library(readr))
 stop_report <- function(stop_id){
   tstamp <- Sys.time()
   
-  resp <- tryCath(GET('http://www.ttss.krakow.pl/internetservice/services/passageInfo/stopPassages/stop',
+  resp <- tryCatch(GET('http://www.ttss.krakow.pl/internetservice/services/passageInfo/stopPassages/stop',
       query = list(stop = stop_id), timeout(15)),
       error = function(err){ #To handle connection errors
         message(paste('Problem occured at', tstamp))
@@ -53,6 +53,7 @@ stop_report <- function(stop_id){
 many_stops <- function(stops){ #takes about 20 sec
   city <- lapply(stops, stop_report)
   do.call(rbind, city)
+  Sys.sleep(2)
 }
 
 to_save <- function(row, df){
