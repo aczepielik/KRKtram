@@ -63,7 +63,7 @@ to_remove <- function(report){
 report_completion <- function(report){
   report$delay <- difftime(floor_date(report$time_stamp, 'minute'), report$plannedTime, units = 'min')
   report$delay[report$delay < 0] <- 0
-  report$stopName <- sapply(report$stop, function(x) stop_names[stop_names$shortName == x, 1])
+  report$stopName <- sapply(report_final$stop, function(x) head(stop_names[stop_names$shortName == x, 1], 1))
   
   report %>% 
     select(index, time_stamp, stop, stopName, number, direction, plannedTime, vehicleId, tripId, status, delay) %>%
@@ -72,7 +72,7 @@ report_completion <- function(report){
 
 periodic_report <- function(end, stops = stop_names$shortName){
   #Every 15 minutes report will be cleared and saved to csv
-  saving_times <- seq(Sys.time(), end, by = '15 min') 
+  saving_times <- seq(Sys.time(), end + minutes(16), by = '15 min') 
   
   save_index <- 2 #to iterate over saving times
   i <- 1 #to iterate over queries
@@ -132,7 +132,7 @@ periodic_report <- function(end, stops = stop_names$shortName){
   report_final <- report_final[!to_remove(report_final), ] #Final clering
   
   report_completion(report_final) %>% 
-  write.csv(report, 'report.csv', row.names = FALSE, fileEncoding = 'UTF-8')
+  write.csv('report.csv', row.names = FALSE, fileEncoding = 'UTF-8')
   
 }
 
