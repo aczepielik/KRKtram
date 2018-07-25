@@ -1,0 +1,174 @@
+---
+title: "Analyses"
+author: "Adam Czepielik"
+date: "24 lipca 2018"
+output: html_document
+---
+
+# Dane
+```{r}
+suppressPackageStartupMessages(library(httr))
+suppressPackageStartupMessages(library(jsonlite))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(lubridate))
+suppressPackageStartupMessages(library(readr))
+
+report <-  read_csv('report_07-23.csv', col_types = cols(
+    index = col_integer(),
+    time_stamp = col_datetime(format = ""),
+    stop = col_integer(),
+    number = col_integer(),
+    direction = col_character(),
+    plannedTime = col_datetime(format = ""),
+    vehicleId = col_character(),
+    tripId = col_character(),
+    status = col_character()
+  ))
+
+report <- filter(report, !is.na(vehicleId))
+```
+
+
+# Ogólne spojrzenie
+```{r}
+library(ggplot2)
+
+ggplot(report, aes(time_stamp, delay)) + geom_jitter(alpha = 0.1)
+```
+
+```{r}
+ggplot(report, aes(delay)) + geom_histogram(binwidth = 1)
+```
+```{r}
+stop_ranking <- report %>% group_by(stopName) %>% summarise(mean_delay = mean(delay, na.rm = TRUE), sq = min(seq_num, na.rm = TRUE))
+
+stop_ranking %>%  arrange(desc(mean_delay)) %>% head(10)
+stop_ranking %>% filter(sq > 1) %>%  arrange(mean_delay) %>% head(10)
+```
+
+```{r}
+line_ranking <- report %>% group_by(number, direction) %>% summarise(mean_delay = mean(delay, na.rm = TRUE)) 
+
+line_ranking %>%  arrange(desc(mean_delay)) %>% head(10)
+line_ranking %>%  arrange(mean_delay) %>% head(10)
+```
+
+<details> <summary style="color:red"> Kliknij, żeby zobaczyć wykresy </summary>
+```{r}
+ggplot(line_ranking[line_ranking$number %in% c(1:9), ], aes(x = mean_delay, y = as.factor(direction), label = direction)) + geom_point(alpha = 0.7) + geom_text(position = position_nudge(y = 0.4)) + coord_cartesian(xlim = c(0, 2.5)) + facet_grid(as.factor(number) ~ ., scales = 'free_y')
+
+ggplot(line_ranking[line_ranking$number %in% c(10:19), ], aes(x = mean_delay, y = as.factor(direction), label = direction)) + geom_point(alpha = 0.7) + geom_text(position = position_nudge(y = 0.4)) + coord_cartesian(xlim = c(0, 2.5)) + facet_grid(as.factor(number) ~ ., scales = 'free_y')
+
+ggplot(line_ranking[line_ranking$number %in% c(20:52), ], aes(x = mean_delay, y = as.factor(direction), label = direction)) + geom_point(alpha = 0.7) + geom_text(position = position_nudge(y = 0.4)) + coord_cartesian(xlim = c(0, 2.5)) + facet_grid(as.factor(number) ~ ., scales = 'free_y')
+```
+</details>
+
+```{r}
+library(leaflet)
+library(RColorBrewer)
+library(htmltools)
+library(ggmap)
+
+stop_names <- readRDS('stop-name-db.RDS')
+krk_bbox <- make_bbox(longitude, latitude, data = stop_names)
+
+pal <- colorNumeric('RdYlGn', domain = c(0.06, 2.5), reverse = TRUE)
+
+stops_map <- left_join(report, stop_names, by = c('stop' = 'shortName', 'stopName' = 'name')) %>% 
+  group_by(stop, stopName, longitude, latitude) %>% 
+  summarise(avg = as.numeric(mean(delay, na.rm = TRUE)))
+
+leaflet() %>% 
+  addProviderTiles(providers$Stamen.TonerLines, options = providerTileOptions(minzoom = 8)) %>% 
+  setView(lng = 19.9388, lat = 50.0617, zoom = 12) %>% 
+  setMaxBounds(krk_bbox[[1]] - 0.03, krk_bbox[[2]] - 0.03, krk_bbox[[3]] + 0.03, krk_bbox[[4]] + 0.03) %>% 
+  addCircleMarkers(data = stops_map, 
+                   color = ~pal(avg), opacity = 1, fillOpacity = 0.7,
+                   label = ~stopName,
+                   popup = ~paste0('<b>', htmlEscape(stopName), '</b>',
+                                   '</br>',
+                                   'Średnie opóźnienie:', ' ', round(avg, 2), ' min'))
+```
+
+```{r}
+ggplot(report, aes(seq_num, delay)) + geom_jitter(alpha = 0.3) + geom_smooth()
+```
+
+```{r}
+routes <- readRDS('routes.RDS')
+
+report_routes <- report %>% group_by(tripId) %>% arrange(tripId, seq_num) %>% 
+  rename(from = stopName) %>% 
+  mutate(to = lead(from)) %>%
+  filter(!is.na(to)) %>% 
+  mutate(name = paste(from, to, sep = " - "), delay_increment = c(0, diff(delay))) %>% 
+  ungroup() %>% 
+  select(index, time_stamp, number, direction, name, delay, delay_increment, seq_num) %>% 
+  inner_join(routes, by = 'name') 
+#%>% 
+  # select(-from, -to, -from.longitude, -from.latitude, -to.longitude)
+
+report_routes_map <- report_routes %>% group_by(name) %>%
+  summarise(avg_increment = mean(delay_increment)) %>% 
+  arrange(desc(avg_increment)) %>% right_join(routes, by = 'name') %>% 
+  select(-from, -to)
+
+transform_cos <- function(x, y, xend, yend){
+  r <- sqrt((xend - x)^2 + (yend - y)^2)
+  (xend - x)/r
+}
+
+transform_sin <- function(x, y, xend, yend){
+  r <- sqrt((xend - x)^2 + (yend - y)^2)
+  (yend - y)/r
+}
+
+routes2 <- report_routes_map %>% rowwise() %>%
+  mutate(cosinus = transform_cos(from.longitude, from.latitude, to.longitude, to.latitude),
+         sinus = transform_sin(from.longitude, from.latitude, to.longitude, to.latitude)) %>% 
+  mutate(from.longitude = from.longitude + sqrt(lines)*0.0002*sinus,
+         from.latitude = from.latitude - sqrt(lines)*0.0002*cosinus,
+         to.longitude = to.longitude + sqrt(lines)*0.0002*sinus,
+         to.latitude=  to.latitude - sqrt(lines)*0.0002*cosinus) %>% 
+  ungroup()
+
+library(leaflet.extras)
+route_pal <- colorNumeric('RdBu', domain = c(-1, 1), reverse = TRUE)
+
+routes_leaflet <- 
+  leaflet() %>% 
+  addProviderTiles(providers$Stamen.TonerLines, options = providerTileOptions(minzoom = 8, opacity = 0.1)) %>% 
+  setView(lng = 19.9410, lat = 50.0617, zoom = 12) %>% 
+  setMaxBounds(krk_bbox[[1]] - 0.03, krk_bbox[[2]] - 0.03, krk_bbox[[3]] + 0.03, krk_bbox[[4]] + 0.03)
+
+for(i in 1:nrow(routes2)){
+  routes_leaflet <- routes_leaflet %>% 
+    addPolylines(lng = c(routes2$from.longitude[i], routes2$to.longitude[i]),
+                 lat = c(routes2$from.latitude[i], routes2$to.latitude[i]),
+                 color = route_pal(routes2$avg_increment[i]),
+                 opacity = 1,
+                 weight = sqrt(routes2$lines[i])*2.5,
+                 label = routes2$name[i],
+                 popup = paste0('<b>', report_routes_map$name[i], '</b>', '</br>',
+                                'Średnia zmiana opóźnienia: ', round(routes2$avg_increment[i], 2), 'min', '</br>',
+                                'Liczba linii: ', routes2$lines[i]))
+}
+
+routes_leaflet <- routes_leaflet %>% 
+  addCircles(data = stops_map,
+             color = 'black',
+             opacity = 0.7, fillOpacity = 0.7,
+             label = ~stopName,
+             group = 'stops') %>% 
+  addLegend(pal = route_pal, values = ~avg_increment, data = routes2, 
+            position = 'bottomright', opacity = 1,
+            labFormat = labelFormat(prefix = " "),
+            title = 'Średni przyrost opóźnienia') %>% 
+  addSearchFeatures(targetGroups = 'stops',
+                    options = searchFeaturesOptions(
+                      zoom = 14, firstTipSubmit = TRUE,
+                      autoCollapse = TRUE, hideMarkerOnCollapse = TRUE))
+
+routes_leaflet
+```
+
