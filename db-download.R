@@ -11,12 +11,16 @@ stop_names <- stop_names[[1]]
 
 stop_names <- stop_names[c('name', 'shortName', 'latitude', 'longitude')]
 stop_names$shortName <- as.numeric(stop_names$shortName)
-stop_names$latitude <- stop_names$latitude/3600000
+stop_names$latitude <- stop_names$latitude/3600000 #notation correction
 stop_names$longitude <- stop_names$longitude/3600000
+
+stop_names[stop_names$name == 'Podgórze SKA', ]$longitude <- 19.960779 #position correction
+stop_names[stop_names$name == 'Podgórze SKA', ]$latitude <- 50.042421
+
 
 saveRDS(stop_names, 'stop-name-db.RDS')
 
-# Map between dtops and lines
+# Map between stops and lines
 library(rvest)
 
 lines <- c(1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 13, 14, 16, 18, 19, 20, 21, 22, 24, 44, 50, 52)
@@ -58,3 +62,26 @@ linestops$direction <- gsub('Cmentarz Rakowicki', 'Cm. Rakowicki', linestops$dir
 linestops$direction <- gsub('Dworzec Towarowy', 'Dworzec Tow.', linestops$direction)
 
 saveRDS(linestops, 'linestops.RDS')
+
+# Routes
+routes <- linestops %>% select(number, direction, name) %>% 
+  left_join(stop_names, by = 'name') %>% select(-shortName) %>% 
+  group_by(number, direction) %>% 
+  rename(from = name, from.longitude = longitude, from.latitude = latitude) %>% 
+  mutate(to = lead(from), to.longitude = lead(from.longitude), to.latitude = lead(from.latitude)) %>%
+  mutate(name = paste(from, to, sep = " - ")) %>% ungroup() %>% 
+  select(name, from, to, from.longitude, from.latitude, to.longitude, to.latitude) %>% 
+  filter(!is.na(to)) %>% 
+  group_by(name, from, to, from.longitude, from.latitude, to.longitude, to.latitude) %>% 
+  summarise(lines = n())
+
+saveRDS(routes, 'routes.RDS')
+
+line_routes <- linestops %>% select(number, direction, name) %>% 
+  left_join(stop_names, by = 'name') %>% select(-shortName) %>% 
+  group_by(number, direction) %>% 
+  rename(from = name, from.longitude = longitude, from.latitude = latitude) %>% 
+  mutate(to = lead(from), to.longitude = lead(from.longitude), to.latitude = lead(from.latitude)) %>%
+  mutate(name = paste(from, to, sep = " - ")) %>%
+  select(name, from, to, from.longitude, from.latitude, to.longitude, to.latitude) %>% 
+  filter(!is.na(to)) %>% ungroup()
