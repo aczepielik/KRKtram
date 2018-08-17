@@ -63,7 +63,7 @@ to_remove <- function(report){
 report_completion <- function(report){
   report$delay <- difftime(floor_date(report$time_stamp, 'minute'), report$plannedTime, units = 'min')
   report$delay[report$delay < 0] <- 0
-  report$stopName <- sapply(report_final$stop, function(x) head(stop_names[stop_names$shortName == x, 1], 1))
+  report$stopName <- sapply(report$stop, function(x) head(stop_names[stop_names$shortName == x, 1], 1))
   
   report %>% 
     select(index, time_stamp, stop, stopName, number, direction, plannedTime, vehicleId, tripId, status, delay) %>%

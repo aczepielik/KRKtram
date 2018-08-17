@@ -48,9 +48,9 @@ for(i in lines){
 linestops <- lapply(linestops, unique)
 
 for(i in seq_along(linestops)){
-  linestops[[i]]$seq_num <- seq(dim(linestops[[i]])[1])
-  linestops[[i]]$number <- rep(lines[ceiling(i/2)], dim(linestops[[i]])[1])
-  linestops[[i]]$direction <- unlist(rep(tail(linestops[[i]][1], 1), dim(linestops[[i]])[1]))
+  linestops[[i]]$seq_num <- seq(nrow(linestops[[i]]))
+  linestops[[i]]$number <- rep(lines[ceiling(i/2)], nrow(linestops[[i]]))
+  linestops[[i]]$direction <- unlist(rep(tail(linestops[[i]][1], 1), nrow(linestops[[i]])))
   
   names(linestops[[i]]) <- c('name', 'seq_num', 'number', 'direction')
 }
@@ -64,6 +64,11 @@ linestops$direction <- gsub('Dworzec Towarowy', 'Dworzec Tow.', linestops$direct
 saveRDS(linestops, 'linestops.RDS')
 
 # Routes
+
+### Consists of records like:
+# name | from | to | from.longitude | from.latitude | to.longitude | to.latitude | lines (number of)
+# Agencja - Blokowa | Agencja | Blokowa | 20.07 | 50.08 | 20.07 | 50.08534 | 1
+
 routes <- linestops %>% select(number, direction, name) %>% 
   left_join(stop_names, by = 'name') %>% select(-shortName) %>% 
   group_by(number, direction) %>% 
@@ -85,3 +90,19 @@ line_routes <- linestops %>% select(number, direction, name) %>%
   mutate(name = paste(from, to, sep = " - ")) %>%
   select(name, from, to, from.longitude, from.latitude, to.longitude, to.latitude) %>% 
   filter(!is.na(to)) %>% ungroup()
+
+saveRDS(line_routes, 'line-routes.RDS')
+
+line_routes_directed <- linestops %>% select(number, direction, name) %>% 
+  left_join(stop_names, by = 'name') %>% select(-shortName) %>% 
+  group_by(number, direction) %>% 
+  rename(by = name) %>% 
+  mutate(from = lag(by), to = lead(by)) %>%
+  mutate(name = paste(from, by, to, sep = " -> ")) %>%
+  select(number, direction, from, by, to, name, longitude, latitude) %>% 
+  ungroup()
+
+saveRDS(line_routes_directed, 'line-routes-directed.RDS')
+
+just_directions <- line_routes_directed %>% 
+  select(from, by, to, name, longitude, latitude) %>% unique()
