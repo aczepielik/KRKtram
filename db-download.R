@@ -45,7 +45,9 @@ for(i in lines){
     html_node(xpath = 'table') %>% html_table(fill = TRUE) %>% `[`(1)
 }
 
-linestops <- lapply(linestops, unique)
+#Correction for repeated loops
+linestops[c("1__1", "1__2", "2__1", "2__2", "6__1", "6__2")] <- lapply(
+  linestops[c("1__1", "1__2", "2__1", "2__2", "6__1", "6__2")], unique)
 
 for(i in seq_along(linestops)){
   linestops[[i]]$seq_num <- seq(nrow(linestops[[i]]))
@@ -57,6 +59,7 @@ for(i in seq_along(linestops)){
 
 linestops <- do.call(rbind, linestops)
 
+#Correction for differences in naming between MPK and TTSS
 linestops$direction <- gsub('Wzgórza Krzesławickie', 'Wzgórza K.', linestops$direction)
 linestops$direction <- gsub('Cmentarz Rakowicki', 'Cm. Rakowicki', linestops$direction)
 linestops$direction <- gsub('Dworzec Towarowy', 'Dworzec Tow.', linestops$direction)
@@ -82,6 +85,9 @@ routes <- linestops %>% select(number, direction, name) %>%
 
 saveRDS(routes, 'routes.RDS')
 
+### Consists of records like:
+# number | direction| name | from | to | from.longitude | from.latitude | to.longitude | to.latitude
+# 22 | Borek Fałęcki | Agencja - Blokowa | Agencja | Blokowa | 20.07 | 50.08 | 20.07 | 50.08534
 line_routes <- linestops %>% select(number, direction, name) %>% 
   left_join(stop_names, by = 'name') %>% select(-shortName) %>% 
   group_by(number, direction) %>% 
@@ -93,6 +99,10 @@ line_routes <- linestops %>% select(number, direction, name) %>%
 
 saveRDS(line_routes, 'line-routes.RDS')
 
+### Modification of above. Consists of records like:
+# number | direction| from | by | to | name| longitude (of 'by') | latitude (of 'by')
+# 1 | Salwator | Wzgórza Krzesławickie | Jarzębiny | Darwina |Wzgórza Krzesławickie -> Jarzębiny -> Darwina | 20.06051 |50.09177
+
 line_routes_directed <- linestops %>% select(number, direction, name) %>% 
   left_join(stop_names, by = 'name') %>% select(-shortName) %>% 
   group_by(number, direction) %>% 
@@ -103,6 +113,3 @@ line_routes_directed <- linestops %>% select(number, direction, name) %>%
   ungroup()
 
 saveRDS(line_routes_directed, 'line-routes-directed.RDS')
-
-just_directions <- line_routes_directed %>% 
-  select(from, by, to, name, longitude, latitude) %>% unique()
