@@ -1,9 +1,3 @@
----
-title: Tram delays in Kraków
-author: Adam Czepielik
-date: '2018-08-29'
----
-
 When I was learning how to work with APIs in R few months ago, I discovered there is an API for tram locations and departures in my home town - Kraków. Since then I've been planning the analysis of tram delays based on it and eventually I've taken it as my personal summer project. 
 
 The entire report in Polish is dozens page long. Here, on the English side of the blog, I omit the overview of data preparation and technical details, which are important but not so much interesting and present several selected insights.
@@ -21,18 +15,12 @@ A pessimist could say that more than half of the trams depart late. An optimist,
 
 # Maps
 
-Two interactive maps  show mean delays on stops and delay changes between them.
-
-<iframe src="../kraktram.en_files/stop_map.en.html" height="400" width="100%" allowfullscreen="true"></iframe>
-
-The mean delay on a particular stops almost always summarizes delays on different paths with this stop in a middle. Those different paths (at least two opposite directions) can differ, sometimes strongly, from each other with respect to average delay. Therefore, I specify mean delay on each path in pop-ups. As system measures departures, not arrivals, there are missing values near loops (NA for names, NaN for values).
-
-<iframe src="../kraktram.en_files/routes_map.en.html" allowfullscreen="true" height="400" width="100%"></iframe>
+Not available in README. See https://aczepielik.github.io/en/post/kraktram.en/
 
 ## One observation from the second map
 Does it appear to you that intensive-red segments (big delay increase) tend to lie next to intensive-blue (big decrease)? Yes, they are! The graph below shows mean delay change after a given stop against the change before it.
 
-![reduction](https://aczepielik.github.io/post/kraktram.en_files/figure-html/unnamed-chunk-3-1.png)
+<img src="https://aczepielik.github.io/post/kraktram.en_files/figure-html/unnamed-chunk-3-1.png" height="300">
 
 Imagine that some tram has no delay at a given stop (let say: stop 0). At the consecutive stop (stop 1) it has 2 minutes delay and at the next one (stop 2), one minute. From a stop 1 perspective there have been 2 minute increment before it and -1 minute increment (reduction) after. Such scenario will be plotted at the point (2, -1) in this coordinate system.
 
