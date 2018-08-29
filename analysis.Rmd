@@ -1,0 +1,1753 @@
+---
+title: Spóźnienia krakowskich tramwajów
+author: Adam Czepielik
+date: 2018-08-29
+description: "Jakie są szanse, że tramwaj przyjedzie punktualnie? Gdzie występują największe spóźnienia? Jak zależą one od pory dnia? Które linie spóźniają się najbardziej i czy kierunek ma tu znaczenie? Czy tramwaje potrafią nadrobić złapane spóźnienie?"
+tags: [tramwaje, regresja kwantylowa, Kraków]
+
+---
+
+
+```{r global options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, out.width = '95%', fig.width = 8, fig.height = 6, fig.retina = 1, dpi = 300, cache = TRUE)
+library(ggthemr)
+ggthemr('fresh')
+```
+
+```{r loading packages, cache=FALSE}
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(lubridate)
+library(readr)
+library(ggplot2)
+library(ggmap)
+library(leaflet)
+library(leaflet.extras)
+library(knitr)
+library(kableExtra)
+library(RColorBrewer)
+library(htmltools)
+library(mgcv)
+library(qgam)
+library(tidyr)
+library(ggpubr)
+library(forcats)
+```
+
+```{r loading data bases}
+stop_names <- readRDS('data-bases/stop-name-db.RDS') #contains stop names, codes and coordinates
+line_stops <- readRDS('data-bases/linestops.RDS') #contains ordered stop names prescribed to lines and directions 
+routes <- readRDS('/data-bases/routes.RDS') #contains coordinates of track segments
+line_routes <- readRDS('data-bases/line-routes.RDS') #contains coordinates of track segments grouped by lines and directions
+line_routes_directed <- readRDS('data-bases/line-routes-directed.RDS')
+```
+
+```{r reading-reports}
+read_report <- function(day){
+  path <- paste0('~/R/kraktram/reports/report_07-', day, '.csv')
+  read_csv(path, col_types = cols(
+    index = col_integer(),
+    time_stamp = col_datetime(format = ""),
+    stop = col_integer(),
+    number = col_integer(),
+    direction = col_character(),
+    plannedTime = col_datetime(format = ""),
+    vehicleId = col_character(),
+    tripId = col_character(),
+    status = col_character()
+  ))
+}
+
+days <- c(24, 25, 26, 27, 30, 31)
+report <- lapply(days, FUN = read_report)
+report <- do.call(rbind, report)
+```
+
+Od pewnego czasu na stronie [ttss.krakow.pl](http://www.ttss.krakow.pl/) możemy podglądać informacje, które na co dzień widzimy w Krakowie na przystankowych tablicach elektronicznych. Prawdziwa zabawa zaczyna się jednak, gdy wejdziemy wgłąb strony TTSS (*Traffic Tram Supervision System*), na [ttss.krakow.pl/internetservice/](http://www.ttss.krakow.pl/internetservice/). Znajdziemy tam serwis w którym można na żywo śledzić położenie tramwajów na mapie, trasy poszczególnych składów, czy przewidywane czasy odjazdów. O stronie zrobiło się głośno, gdy Jacek Kowalski przygotował i udostępnił *pro publico bono* znacznie wygodniejszą wersję mapki (https://mpk.jacekk.net). Od tego czasu powstało też kilka innych stron i aplikacji oferujących dostęp do serwisu. Natomiast ja postanowiłem pobrać z niego trochę danych i na ich podstawie przeanalizować, jak się spóźniają krakowskie tramwaje.
+
+
+# Pobieranie i czyszczenie danych
+
+## API
+Pójdźmy jeszcze bardziej wgłąb strony TTSS. Uruchamiając w przeglądarce narzędzia deweloperskie, można sprawdzić jak działa API serwisu. Najważniejsze ścieżki udostępniają:
+
+ - `geoserviceDispatcher/services/vehicleinfo/vehicles`: dane o pojazdach i ich położeniach oraz numer przejazdu, który realizują.
+ - `services/routeInfo/routeStops?routeId=ID`: numery i nazwy przystanków na trasie o podanym ID, w kolejności alfabetycznej.
+ - `services/tripInfo/tripPassages?tripId=tID&vehicleId=vID`: trasa i przewidywane czasy przyjazdu tramwaju o podanym vID, realizującego przejazd tID.
+ - `geoserviceDispatcher/services/stopinfo/stops?left=-648000000&bottom=-324000000&right=648000000&top=324000000`: numery, nazwy i położenia przystanków.
+  - `services/passageInfo/stopPassages/stop?stop=ID`: informacje o spodziewanych i niedawnych odjazdach z przystanku o podanym ID.
+
+I tak na przykład odpytując adres http://www.ttss.krakow.pl/internetservice/services/passageInfo/stopPassages/stop?stop=77 dostaniemy dane o odjazdach z Teatru Bagatela. Numery Id przystanków można wziąć ze `stopinfo`, więc żeby zbadać spóźnienia, nie pozostaje nic innego jak sprawdzać wszystkie przystanki po kolei. Trzeba tylko uważać na drobne różnice w formatach odpowiedzi.
+
+Takie sprawdzanie wszystkich przystanków trochę trwa. Na moim komputerze jedna runda zapytań o wszystkie przystanki trwała nieco ponad 20 sekund. Teoretycznie można by to zrobić o wiele szybciej: pobrać położenia wszystkich tramwajów (jeden plik), sprawdzić czy znajdują się w pobliżu przystanków i porównać z rozkładami jazdy. Niestety skojarzenie konkretnego pojazdu z rozkładem nie byłoby proste, biorąc pod uwagę, że niektóre z nich nie są podłączone do TTSS.
+
+Strona TTSS pokazuje przystanki poszczególnych linii w kolejności alfabetycznej, co nie jest specjalnie użyteczne. Można też znaleźć na mapie tramwaj konkretnej linii i wziąć kolejno poukładane przystanki z danych o jego trasie. Stwierdziłem jednak, że prościej będzie wyciągnąć trasy z rozkładów opublikowanych na stronie MPK. 
+
+Do pobierania danych używałem pakietów `httr` i `rvest`. Przydatne były też: `jsonlite` - do zamiany plików *.json na obiekty R, `readr` - do zapisywania i odczytywania pobranych danych, oraz niezastąpiony SelectorGadget.
+
+## Jak zdefiniować spóźnienie?
+Nic trudnego, zdawałoby się. Jeżeli tramwaj miał przyjechać o 8:02, a przyjechał o 8:06, to zapisujemy 4 minuty spóźnienia. Problem pojawia się jeżeli tramwaj nie przyjechał. Jeżeli po 10 minutach przyjechał następny, to być może powinniśmy zapisać 10 minut spóźnienia. Co jednak zrobić jeśli ostatecznie przyjedzie on na przystanek, ale po 12 minutach. Taka sytuacja może się zdarzyć jeśli spóźnienie wynika z nadzwyczajnej zmiany trasy. Może więc 12 minut? Czekających pasażerów, można by odpowiedzieć, niespecjalnie interesuje jednak co się stało już po odjeździe kolejnego tramwaju. Ale z drugiej strony, jeżeli taka sytuacja zdarzy się w miejscu, gdzie wszystkie linie jadące w danym kierunku mają tą samą trasę (np. niedaleko pętli), to ci pasażerowie mogli wsiąść w tramwaj innej linii i czekać mniej niż 10 minut, więc to też nie jest najlepsze kryterium.
+
+Z pewną pomocą przychodzi TTSS, w którym kursy anulowane znikają (choć nie zawsze) z tablic oczekiwanych przyjazdów. Na przykład w środę 25.07 odbywał się remont przy tunelu pod Dworcem Głównym. Jadące tam linie miały zmienione trasy i informacje na temat ich odjazdów pojawiały się tylko na tych ich częściach, które zmieniane nie były. Żeby zachować spójność z systemem z którego korzystam przyjąłem następującą procedurę określania spóźnienia: 
+
+ 1. Jeżeli tramwaj przestał być śledzony przez system, to kurs jest traktowany tak jakby w ogóle nie był planowany.
+ 2. Jeżeli tramwaj zostanie odnotowany na przystanku, to spóźnienie jest liczone jest liczone jako różnica między rzeczywistym, a planowanym czasem przyjazdu. Przy czym jako rzeczywisty czas przyjazdu będę rozumiał albo czas zapytania w którym system pokazał, że tramwaj zatrzymuje się na przystanku, albo czas ostatniego zapytania, gdy przyjazd był jeszcze oczekiwany. Na informacjach o tym, że tramwaj się zatrzymuje nie można do końca polegać.
+ 3. Jeżeli tak wyliczone spóźnienie jest duże, to sprawdzam w komunikatach publikowanych przez MPK, czy da się je powiązać z jakąś awarią. Jeżeli okaże się, że takie spóźnienie wynika ze zbyt późnego „anulowania kursu” (co miało miejsce na przykład przy tymczasowym skróceniu linii 6 i 24 do Prokocimia), to usuwam takie obserwacje ręcznie.
+
+## Czas badania
+
+Dane zbierałem od wtorku 24.07 do wtorku 31.07, z pominięciem weekendu. Był to pierwszy tydzień obwiązywania poprawionego rozkładu jazdy, po zakończeniu remontu na Bieńczyckiej.
+
+W weekend odbyła się naprawa szyn w okolicach skrzyżowania ulic Nowosądeckiej i Spółdzielców. Po naprawie średnie opóźnienia obniżyły się, a istotne różnice w rozkładach spóźnień występowały na przystankach Piaski Nowe i Nowosądecka, dla tramwajów jadących do Kurdwanowa, oraz od Witosa aż do Podgórze SKA, dla tych jadących w drugą stronę. Przynajmniej część z tych różnic trudno powiązać bezpośrednio z remontem, bo pojawiają się na kilka przystanków przed naprawianym odcinkiem. **Tak czy owak, wyniki dla okolic pętli Kurdwanów P+R oraz dla początkowych odcinków linii 6 i 24 kursujących z tej pętli, mogą być z powodu remontu niemiarodajne.** 
+
+<details><summary> Szczegóły ▼ </summary>
+
+Rozkład spóźnień traktuję tutaj jako dyskretny i badam zgodność testem chi-kwadrat. Pierwszy test dotyczy tramwajów jadących w stronę pętli Kurdwanów P+R, a drugi - wyjeżdżających z tej pętli.
+
+```{r, echo=TRUE}
+repair_test <- function(x){
+print(x)
+
+#select departures to Kurdwanów
+to <- report %>% filter(stopName == x & direction == 'Kurdwanów P+R') %>% select(delay, plannedTime) %>% mutate(repair = day(plannedTime)>=30, delay = as.factor(delay)) %>% select(-plannedTime)
+
+#determine which levels of delays should be merged to meet chi square test assumptions
+drop <- to %>% group_by(repair) %>% count(delay) %>% filter(n >= 5) %>% arrange(n) %>% summarize(threshold = first(delay)) %>% `$`(threshold) %>% as.character() %>% as.numeric() %>% min()
+
+#merge levels
+to$delay <- fct_lump(to$delay, n = drop, other_level = 'bigger')
+
+#test
+table(to) %>% chisq.test() %>% print()
+
+from <- report %>% filter(number %in% c(6, 24) & stopName == x & direction != 'Kurdwanów P+R') %>% select(delay, plannedTime) %>% mutate(repair = day(plannedTime)>=30, delay = as.factor(delay)) %>% select(-plannedTime)
+
+drop <- from %>% group_by(repair) %>% count(delay) %>% filter(n >= 5) %>% arrange(n) %>% summarize(threshold = first(delay)) %>% `$`(threshold) %>% as.character() %>% as.numeric() %>% min()
+
+from$delay <- fct_lump(from$delay, n = drop, other_level = 'bigger')
+
+table(from) %>% chisq.test() %>% print()
+}
+
+purrr::walk(c("Witosa", "Nowosądecka", "Piaski Nowe", "Dauna", "Bieżanowska", "Kabel", "Dworcowa", "Cmentarz Podgórski", "Podgórze SKA", "Limanowskiego"), repair_test)
+```
+</details>
+
+**Poza tym, wyników analizy nie należy stosować poza wakacyjny rozkład jazdy.**
+
+## Czyszczenie i braki danych
+Z pobranych danych trzeba było wyrzucić te błędne i niemiarodajne:
+
+### Niemiarodajne dane z powodu zmian trasy i zatrzymań
+We wtorek 24.07 linie 24 i 6 były przez jakiś czas kierowane do pętli w Prokocimiu, zamiast do Kurdwanowa. Mimo to były pokazywane jako oczekiwane na swojej zwyczajnej trasie, co zasktutkowało zanotowanie ponad godzinnych spóźnień, zanim nierealizowane przyjazdy zostały usunięte z systemu. Te dane usunąłem ręcznie.
+
+
+W środę 25.07 odbywał się remont tunelu pod Dworcem Głównym i jadące tamtędy linie zostały skierowane na objazdy. TTSS mierzył czasy odjazdów tylko na czynnych fragmentach zwyczajnej trasy. Na linii 50 objazd powodował znaczne spóźnienia, tak że pomiary na przystankach odwiedzanych po zakończeniu objazdu były niemiarodajnie duże. Te dane również usunąłem.
+
+We wtorek 31.07 miało miejsce zatrzymanie przy rondzie Mogilskim, które przez długi czas wpływało na ruch na kilku liniach. Ponieważ było to jedyne zatrzymanie tego typu usuwałem dane o kursach, które ucierpiały z jego powodu
+
+Mniejsze, kilkuminutowe zatrzymania pozostawiałem bez zmian, uznając je za coś, co po prostu czasem się zdarza.
+
+### Brak połączenia z TTSS
+
+Niektóre tramwaje nie są wyposażone w sprzęt umożliwiający ich śledzenie, a te które mają czasami tracą połączenie z systemem. W takich sytuacjach TTSS wciąż nadaje kursowi numer Id, ale pokazuje tylko czas rozkładowy. Odjazdów z przystanków, które zaplanowano, ale które nie zostały zarejestrowane z powodu braku sprzętu lub tego, że nie działał było w sumie 12%, choć na niektórych liniach sporo więcej.
+
+
+```{r gps-propotion prep}
+#Preparing data frame to plot proportion of registered departures
+plotdf <- report %>% 
+  group_by(is.na(vehicleId)) %>% summarise(proportion = n()/nrow(report)) %>% 
+  mutate(x = c(1, 1), y = 1 - proportion/2) %>% 
+  rename(noGPS = `is.na(vehicleId)`)
+
+lines <- c(1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 13, 14, 16, 18, 19, 20, 21, 22, 24, 44, 50, 52)
+
+lineplotdf <- list()
+
+for(i in lines){
+  lab =as.character(i)
+  lineplotdf[[lab]] <- report %>% filter(number == i) %>%
+  group_by(is.na(vehicleId)) %>% summarise(proportion = n()/nrow(report %>% filter(number == i))) %>%
+  mutate(y = c(0.07, 0.925)) %>%
+  rename(noGPS = `is.na(vehicleId)`) %>% cbind(., x = 1, number = i)
+  
+  lineplotdf[[lab]]$noGPS <- factor(lineplotdf[[lab]]$noGPS, levels = c(TRUE, FALSE), ordered = TRUE)
+}
+
+lineplotdf <- do.call(rbind, lineplotdf)
+
+over_avg <- lineplotdf %>% filter(noGPS == TRUE, proportion > 0.12) %>% arrange(desc(proportion)) %>% select(number)
+
+lineplotdf <- lineplotdf %>% filter(number %in% over_avg[[1]])
+lineplotdf$number_f <- factor(lineplotdf$number, levels = over_avg[[1]])
+```
+
+```{r gps general proportion, fig.height=1.5, fig.width=8}
+ggplot(plotdf, aes(x = 1, y = proportion, fill = as.factor(proportion))) + 
+  geom_bar(stat = 'identity') + 
+  geom_label(aes(y = y, label = paste(round(proportion * 100), '%')), fill = 'white', show.legend = FALSE) +
+  coord_flip() + 
+  labs(title = 'Odjazdy zarejestrowane w TTSS', x = '', y = '') +
+  scale_x_continuous(labels = NULL, expand = c(0,0)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.1), labels = scales::percent, expand = c(0,0)) + 
+  scale_fill_discrete(name = '', labels = c('Niezarejestrowane', 'Zarejestrowane'))
+```
+
+Poniższy wykres przedstawia dane o liniach, na których odsetek odjazdów niezarejestrowanych jest większy niż średnia.
+
+```{r gps by line, fig.height=4}
+ggplot(lineplotdf, aes(x = 1, y = proportion, fill = as.factor(noGPS))) + 
+  geom_bar(stat = 'identity') + 
+  geom_label(aes(y = y, label = paste(round(proportion * 100), '%')), fill = 'white', show.legend = FALSE) +
+  facet_grid(number_f ~ .) + 
+  coord_flip() + 
+  labs(title = 'Linie z największym odsetkiem niezarejstrowanych odjazdów', x = '', y = '') +
+  scale_x_continuous(labels = NULL, expand = c(0,0)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.1), labels = scales::percent, expand = c(0,0)) + 
+  scale_fill_discrete(name = '', labels = c('Niezarejestrowane', 'Zarejestrowane')) + theme(strip.background = element_rect(fill = "gray75", 
+    linetype = "solid"), strip.text = element_text(face = "bold")) +labs(x = NULL, y = NULL)
+```
+
+### Błędy systemu
+Typowy błąd systemu najłatwiej będzie pokazać na przykładzie. Rozwijana niżej tabela zawiera dane o przejeździe tramwaju linii 4 w kierunku Bronowic, o numerze kursu 6351558574044474122.
+
+<details><summary>**Klinknij, żeby rozwinąć tabelę ▼**</summary>
+```{r sytem error example}
+readRDS("~/R/kraktram/error_example.RDS") %>% kable() %>% kable_styling(font_size = 13)
+```
+
+</details>
+
+W pierwszej kolumnie są numery kolejnych rund zapytań serwera (runda obejmuje wszystkie przystanki, trwa 20 sekund). W drugiej: kolejność przystanków na trasie. W trzeciej: nazwa przystanku. W czwartej: czas wysłania zapytania do serwera (zaokrąglając do pełnych minut możemy o utożsamiać z rzeczywistym czasem, odjazdu). W piątej: planowany czas odjazdu. W szóstej: status obserwacji (PLANNED - nie śledzony, PREDICTED - oczekiwany, STOPPING - stoi na przystanku, czyli *>>>* na tablicach),. W siódmej: wyliczone opóźnienie.
+
+Pokazany tutaj kurs nie miał na pętli połączenia z systemem. Świadczy o tym status PLANNED. Następnie, od przystanku Jarzębiny do przystanku Struga, tramwaj był oczekiwany, ale nie odnotowano żadnego odjazdu. Około 16:24 kurs został zdjęty z listy oczekiwanych na wszystkich tych przystankach niemal jednocześnie (podobne numery ostatnich zapytań, które pokazywały status PREDICTED: 1732 i 1733). Wtedy też zarejestrowano odjazd (z czterominutowym opóźnieniem) z Placu Centralnego. Dalej rejestracja kursu przebiegała bez zakłóceń.
+
+Z tego kursu usunąłem dane z pierwszych ośmiu przystanków. Przypadków takich jak ten było każdego dnia kilkadziesiąt. Czasem wystarczyło usunąć część danych, czasami cały kurs. Bywa również, że w wyniku błędów brakowało danych z niektórych przystanków.
+
+# Pierwsze wrażenia
+
+## Rozkład spóźnień
+
+Oto, jak przedstawia się rozkład spóźnień:
+
+```{r delay-histogram, fig.height=4}
+report <- report %>% filter(!is.na(vehicleId) & !is.na(seq_num))
+
+ggthemr('fresh', layout = 'scientific')
+ggplot(report, aes(delay)) + geom_histogram(aes(y = ..density..), binwidth = 1, color = swatch()[7]) + 
+  labs(title = "Rozkład spóźnień", x = "Spóźnienie w minutach", y = "") + 
+  scale_x_continuous(breaks = seq(0, 12, 1), expand = c(0,0)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.1), labels = scales::percent, expand = c(0, 0), limits = c(0, 0.5))
+```
+
+Pesymista powiedziałby, że ponad połowa tramwajów przyjeżdża opóźniona. Optymista, że zdecydowaną większość stanowią małe spóźnienia, do 2 minut. Tak czy owak średnie spóźnienie w próbie wyniosło minutę i 0.3 sekundy, a odchylenie standardowe minutę i 23 sekundy (1.39 minuty). Ten rozkład nie daje się łatwo utożsamić z żadnym z rozkładów dobrze znanych z podręczników i to niezależnie czy potraktujemy spóźnienia jako zmienną dyskretną, czy jako ciągłą lecz obarczoną błędami zaokrągleń.
+
+## Spóźnienia w czasie
+
+Zobaczmy jak układa się średnia opóźnienia w zależności od godziny:
+
+```{r}
+datetime_to_minutefs <- function(datetime){
+  if(hour(datetime) == 0){
+    as.numeric(difftime(datetime, floor_date(datetime, unit = 'days'), units = 'mins') + 20*60)
+  } else {
+    as.numeric(difftime(datetime, floor_date(datetime, unit = 'days') + hours(4), units = 'mins'))
+  }
+}
+
+report$minutefs <- sapply(report$plannedTime, datetime_to_minutefs)
+```
+
+```{r, fig.height=4}
+ggplot(report, aes(minutefs, delay)) + geom_smooth(color = swatch()[3], fill = swatch()[2]) + 
+  scale_x_continuous(breaks = seq(60, 19*60 + 30, 30), labels = paste0(sort(rep(seq(5, 23), 2)), rep(c(":00", ":30"), 19))) + 
+  coord_cartesian(ylim = c(0, 2)) + 
+  labs(title = 'Średnia spóźnienia w czasie', y = 'Spóźnienie w minutach') +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(0, 0, 0, -1)),
+            axis.title.x = element_blank())
+```
+
+Prawdę mówiąc spodziewałem się raczej, że będzie wyraźnie widać poranny i popołudniowy szczyt komunikacyjny. Tymczasem rano przyrost spóźnień nie jest tak dynamiczny jak po południu i kumuluje się później niż się myślałem.
+
+<p style="background-color: #e2e2e2; padding: 10px; margin: 5px 10px;"> Krzywa została dopasowana przy użyciu uogólnionego modelu liniowego, co jest metodologicznie śliskie, zważywszy na problemy z identyfikacją rozkładu. Lepsze byłyby metody nieparametryczne. Próbowałem tutaj użyć metody *loess*, ale brakło mi pamięci (loess wymaga O(n^2), pamięci, obserwacji w zbiorze jest ok. 400 tysięcy). Niżej będę korzystał z regresji kwantylowej. </p>
+
+## Rankingi spóźnień
+
+```{r stops-ranking}
+stop_ranking <- report %>% group_by(stopName) %>% summarise(mean_delay = mean(as.numeric(delay), na.rm = TRUE), sq = min(seq_num, na.rm = TRUE))
+```
+
+Przystanki z największym średnim opóźnieniem:
+
+```{r best stops}
+#Best stops
+stop_ranking %>%  arrange(desc(mean_delay)) %>% select(-sq) %>% head(5) %>% kable(row.names = TRUE, col.names = c("Przystanek", "Średnie opóźnienie"), digits = 2) %>% kable_styling(bootstrap_options = 'responsive', font_size = 14)
+```
+
+Wysokie miejsca zajmują jak widać przysatnki, na których wpływ na średnie spóźnienie miał remont torowiska 28 i 29 lipca. Gdyby ranking zrobić tylko dla danych z dni po remoncie przystanki Kabel i Nowosądecka wciąż byłyby w pierwszej piątce, a zamiast Dauna i Piasów Nowych pojawiłyby się Zabłocie i Muzeum Lotnictwa.
+
+Przystanki z najmniejszym średnim opóźnieniem (z pominięciem pętli):
+
+```{r worst stops}
+#Worst stops
+stop_ranking %>% filter(sq > 1) %>%  arrange(mean_delay) %>% select(-sq) %>% head(5) %>% kable(row.names = TRUE, col.names = c("Przystanek", "Średnie opóźnienie"), digits = 2) %>% 
+  kable_styling(bootstrap_options = 'responsive', font_size = 14)
+```
+
+Co ciekawe, przystani z obydwu rankingów znajdują się niedaleko pętli. Można się domyślać (potwierdzą to mapy poniżej), że tramwaje które dojeżdżają do pętli mają spore opóźnienia, a te które dopiero co wyjechały - małe. W rankingach znalazły się te przystanki w których jedna strona tego układu przeważa w średniej. 
+
+Szczególnym przypadkiem jest przystanek Łagiewniki ZUS. Jest on położony niedaleko pętli w Borku Fałęckim i obsługuje tylko jeden tor: do Borku właśnie. Stąd nie dziwi jego pozycja na czele niechlubnego rankingu.
+
+```{r lines-ranking}
+line_ranking <- report %>% group_by(number, direction) %>% summarise(mean_delay = round(mean(delay, na.rm = TRUE), 2)) 
+```
+
+Linie z największym średnim opóźnieniem:
+
+```{r worst lines}
+line_ranking %>%  arrange(desc(mean_delay)) %>% head(5) %>% kable(row.names = TRUE, col.names = c("Numer", "Kierunek", "Średnie opóźnienie")) %>% kable_styling(bootstrap_options = 'responsive', font_size = 14)
+```
+
+Linie z najmniejszym średnim opóźnieniem:
+
+```{r best lines}
+line_ranking %>%  arrange(mean_delay) %>% head(5) %>% kable(row.names = TRUE, col.names = c("Numer", "Kierunek", "Średnie opóźnienie")) %>% kable_styling(bootstrap_options = 'responsive', font_size = 14)
+```
+
+Z takiego prostego zestawienia niewiele jeszcze wynika. Przyjrzyjmy się zatem wszystkim średnim spóźnieniom na wszystkich liniach.
+
+```{r fig.height=7, dpi=350}
+ggplot(line_ranking[line_ranking$number %in% c(1:9), ], aes(x = mean_delay, y = as.factor(direction), label = direction)) + geom_point(size = 3, alpha = 0.7) + geom_segment(aes(xend = 0, yend = as.factor(direction)), color = swatch()[3]) + geom_text(size = 4.5, position = position_nudge(y = 0.3)) + coord_cartesian(xlim = c(0, 2.5)) + facet_grid(as.factor(number) ~ ., scales = 'free_y', space = 'free_y', switch = 'y') + theme(panel.spacing = unit(1, "lines"), strip.background = element_rect(fill = "gray70"), 
+    strip.text = element_text(size = 10, face = "bold")) +labs(x = NULL, y = NULL) + scale_y_discrete(labels = NULL) + labs(title = 'Śrrednie spóźnienia na liniach w rozbiciu na kierunki', x = 'Spóźnienie w minutach')
+```
+
+<details> <summary style="text-align:center;"> **▼ Kliknij, żeby zobaczyć pozostałe linie ▼**</summary>
+
+```{r fig.height=7, dpi=350}
+ggplot(line_ranking[line_ranking$number %in% c(10:19), ], aes(x = mean_delay, y = as.factor(direction), label = direction)) + geom_point(size = 3, alpha = 0.7)+ geom_segment(aes(xend = 0, yend = as.factor(direction)), color = swatch()[3]) + geom_text(size = 4.5, position = position_nudge(y = 0.3)) + coord_cartesian(xlim = c(0, 2.5)) + facet_grid(as.factor(number) ~ ., scales = 'free_y', space = 'free_y', switch = 'y') + theme(panel.spacing = unit(1, "lines"), strip.background = element_rect(fill = "gray70"), 
+    strip.text = element_text(size = 10, face = "bold")) +labs(x = NULL, y = NULL) + scale_y_discrete(labels = NULL)
+
+ggplot(line_ranking[line_ranking$number %in% c(20:52), ], aes(x = mean_delay, y = as.factor(direction), label = direction)) + geom_point(size = 3, alpha = 0.7) + geom_segment(aes(xend = 0, yend = as.factor(direction)), color = swatch()[3]) + geom_text(size = 4.5, position = position_nudge(y = 0.3)) + coord_cartesian(xlim = c(0, 2.5)) + facet_grid(as.factor(number) ~ ., scales = 'free_y', space = 'free_y', switch = 'y')+ theme(panel.spacing = unit(1, "lines"), strip.background = element_rect(fill = "gray70"), 
+    strip.text = element_text(size = 10, face = "bold")) +labs(x = NULL, y = NULL) + scale_y_discrete(labels = NULL)
+```
+</details>
+
+W rankingu najmniej spóźniających się linii wysokie miejsca zajęły krótkie linie 2 i 16. Zobaczmy, czy istnieje związek między długością linii, a średnim spóźnieniem.
+
+```{r}
+line_stops %>% group_by(number, direction) %>% count() %>% 
+  right_join(line_ranking, by = c("number", "direction")) %>% 
+  ggplot(aes(n, mean_delay, label = number)) + geom_smooth() + geom_point(color = swatch()[4]) + geom_label(nudge_y = 0.1) +
+  labs(title = "Średnie spóźnienie w zależności od długości trasy", 
+       y = "Spóźnienie w minutach", x = "Liczba przystanków na trasie") + 
+  scale_x_continuous(breaks = seq(10, 40, 5))
+```
+
+O ile najkrótsze linie mają niewielkie średnie opóźnienia, to nie widać ogólnej, silnej zależności.
+
+# Mapy
+
+Dwie interaktywne mapy poniżej zbierają informacje o średnich spóźnieniach na poszczególnych przystankach (pierwsza) i przyrostach spóźnień pomiędzy nimi (druga). Chociaż średnie ze wszystkich odjazdów pokazują ciekawe zależności, to trzeba pamiętać, że średnie opóźnienie może się mocno różnić w zależności od kierunku ruchu. Dlatego po kliknięciu na kółko przystanku można zobaczyć tabelkę ze spóźnieniami rozpisanymi według wszystkich kierunków. 
+
+Przy rozpisce tras, gdy tramwaj zjeżdża do pętli, pojawia się wartość oznaczenie NA. Ponieważ mierzone są czasy odjazdów brak jest danych o ostatnich odcinkach trasy. Obserwacje są uśredniane według nazw przystanków, więc np. gdy tramwaj linii 11 przejeżdża przez dwa sąsiednie przystanki o nazwie Łagiewniki, to obydwie obserwacje spóźnień będą wliczone do jednej średniej.
+
+Dostępne są tryb pełnoekranowy i wyszukiwarka przystanków. Na mapie z przyrostami grubość kresek odpowiada liczbie linii kursujących na danym odcinku. 
+
+```{r summary-generator, message=FALSE}
+report_directions <- report %>% group_by(tripId) %>% arrange(tripId, seq_num) %>% 
+  rename(by = stopName) %>% 
+  mutate(from = lag(by), to = lead(by)) %>%
+  ungroup() %>% 
+  select(index, number, direction, time_stamp, from, by, delay, seq_num) %>%  
+  right_join(line_routes_directed, by = c('number', 'direction', 'from', 'by'))
+
+directions_summary <- report_directions %>% group_by(by, name) %>%
+  summarise(avg = as.numeric(mean(delay, na.rm = TRUE))) %>% ungroup()
+  
+stop_dir_summary <- function(stopName){
+  filter(directions_summary, by == stopName) %>%
+    select(name, avg) %>% kable(col.names = c("Trasa", "Średnie opóźnienie"), digits = 2)
+}
+
+all_dir_summaries <- lapply(stop_names$name, stop_dir_summary)
+names(all_dir_summaries) <- stop_names$name
+```
+
+```{r stop map}
+krk_bbox <- make_bbox(longitude, latitude, data = stop_names) #boundaries of map
+# 
+pal <- colorNumeric('RdYlGn', domain = c(min(as.numeric(stop_ranking$mean_delay)), max(as.numeric(stop_ranking$mean_delay))), reverse = TRUE)
+# 
+# 
+stops_map <- left_join(report, stop_names, by = c('stop' = 'shortName', 'stopName' = 'name')) %>%
+  group_by(stop, stopName, longitude, latitude) %>%
+  summarise(avg = as.numeric(mean(delay, na.rm = TRUE)))
+
+# leaflet() %>%
+#   addProviderTiles(providers$Stamen.TonerLines, options = providerTileOptions(minzoom = 8)) %>%
+#   setView(lng = 19.9388, lat = 50.0617, zoom = 12) %>%
+#   setMaxBounds(krk_bbox[[1]] - 0.03, krk_bbox[[2]] - 0.03, krk_bbox[[3]] + 0.03, krk_bbox[[4]] + 0.03) %>%
+#   addCircleMarkers(data = stops_map,
+#                    label = ~stopName,
+#                    color = ~pal(avg), opacity = 1, fillOpacity = 0.7,
+#                    group = 'stops',
+#                    popup = ~paste0('<b>', htmlEscape(stopName), '</b>',
+#                                    '</br>',
+#                                    'Średnie opóźnienie:', ' ', round(avg, 2), ' min',
+#                                    '</br>', all_dir_summaries[stopName])) %>%
+#   addCircles(data = stops_map,
+#              color = 'black',
+#              opacity = 0, fillOpacity = 0, weight = 0, radius = 0,
+#              label = ~stopName,
+#              group = 'fix') %>%
+#     addSearchFeatures(targetGroups = 'fix',
+#                     options = searchFeaturesOptions(
+#                       zoom = 14, firstTipSubmit = TRUE,
+#                       autoCollapse = TRUE, hideMarkerOnCollapse = TRUE)) %>%
+#   addFullscreenControl() %>%
+#   addLegend(pal = pal, values = ~as.numeric(mean_delay), data = stop_ranking,
+#             position = 'bottomright', opacity = 1,
+#             labFormat = labelFormat(suffix = " min"),
+#             title = 'Średnie opóźnienie') %>%
+#  htmlwidgets::saveWidget('stop_map.html')
+```
+
+```{r routes-map}
+report_routes <- report %>% group_by(tripId) %>% arrange(tripId, seq_num) %>% 
+  rename(from = stopName) %>% 
+  mutate(to = lead(from)) %>%
+  filter(!is.na(to)) %>% 
+  mutate(name = paste(from, to, sep = " - "), delay_increment = c(diff(delay), 0)) %>% 
+  ungroup() %>% 
+  select(index, time_stamp, number, direction, name, delay, delay_increment, seq_num) %>% 
+  right_join(routes, by = 'name') 
+
+report_routes_map <- report_routes %>% group_by(name) %>%
+  summarise(avg_increment = mean(delay_increment)) %>% 
+  arrange(desc(avg_increment)) %>% right_join(routes, by = 'name') %>% 
+  select(-from, -to)
+
+transform_cos <- function(x, y, xend, yend){
+  r <- sqrt((xend - x)^2 + (yend - y)^2)
+  (xend - x)/r
+}
+
+transform_sin <- function(x, y, xend, yend){
+  r <- sqrt((xend - x)^2 + (yend - y)^2)
+  (yend - y)/r
+}
+
+routes2 <- report_routes_map %>% rowwise() %>%
+  mutate(cosinus = transform_cos(from.longitude, from.latitude, to.longitude, to.latitude),
+         sinus = transform_sin(from.longitude, from.latitude, to.longitude, to.latitude)) %>% 
+  mutate(from.longitude = from.longitude + sqrt(lines)*0.0002*sinus,
+         from.latitude = from.latitude - sqrt(lines)*0.0002*cosinus,
+         to.longitude = to.longitude + sqrt(lines)*0.0002*sinus,
+         to.latitude=  to.latitude - sqrt(lines)*0.0002*cosinus) %>% 
+  ungroup()
+
+library(leaflet.extras)
+route_pal <- colorNumeric('RdBu', domain = c(min(report_routes_map$avg_increment, na.rm = TRUE), 1), reverse = TRUE)
+
+# routes_leaflet <-
+#   leaflet() %>%
+#   addProviderTiles(providers$Stamen.TonerLines, options = providerTileOptions(minzoom = 8, opacity = 0.1)) %>%
+#   setView(lng = 19.9410, lat = 50.0617, zoom = 13) %>%
+#   setMaxBounds(krk_bbox[[1]] - 0.03, krk_bbox[[2]] - 0.03, krk_bbox[[3]] + 0.03, krk_bbox[[4]] + 0.03)
+# 
+# for(i in 1:nrow(routes2)){
+#   routes_leaflet <- routes_leaflet %>%
+#     addPolylines(lng = c(routes2$from.longitude[i], routes2$to.longitude[i]),
+#                  lat = c(routes2$from.latitude[i], routes2$to.latitude[i]),
+#                  color = route_pal(min(routes2$avg_increment[i], 0.999)),
+#                  opacity = 1,
+#                  weight = sqrt(routes2$lines[i])*2.5,
+#                  label = routes2$name[i],
+#                  popup = paste0('<b>', report_routes_map$name[i], '</b>', '</br>',
+#                                 'Średnia zmiana opóźnienia: ', round(routes2$avg_increment[i], 2), 'min', '</br>',
+#                                 'Liczba linii: ', routes2$lines[i]))
+# }
+```
+
+```{r}
+# routes_leaflet %>%
+#   addCircles(data = stops_map,
+#              color = 'black',
+#              opacity = 0.7, fillOpacity = 0.7,
+#              label = ~stopName,
+#              group = 'stops') %>%
+#   addLegend(pal = route_pal, values = ~avg_increment, data = routes2,
+#             position = 'bottomright', opacity = 1,
+#             labFormat = labelFormat(prefix = " "),
+#             title = 'Średni przyrost opóźnienia') %>%
+#   addFullscreenControl() %>%
+#   addSearchFeatures(targetGroups = 'stops',
+#                     options = searchFeaturesOptions(
+#                       zoom = 14, firstTipSubmit = TRUE,
+#                       autoCollapse = TRUE, hideMarkerOnCollapse = TRUE)) %>%
+# htmlwidgets::saveWidget('routes_map.html')
+```
+
+
+<iframe src="../kraktram_files/stop_map.html" height="400" width="100%" allowfullscreen="true"></iframe>
+<iframe src="../kraktram_files/routes_map.html" allowfullscreen="true" height="400" width="100%"></iframe>
+
+## Wnioski z map
+
+ - Mapy potwierdzają postawioną wyżej hipotezę o spóźnieniach w okolicach pętli: na samych pętlach spóźnienie jest małe i tramwaje, które dopiero co wyjechały również mają niewielkie spóźnienia. Z kolei tramwaje kończące trasę przyjeżdżają z większym opóźnieniem. W zależności od skali dysproporcji średnie opóźnienia w okolicach pętli należą do jednych z niższych na mapie (Wzgórza Krzesławickie, Os. Piastów, Mistrzejowice, Cmentarz Rakowicki, Cichy Kącik, Czerwone Maki, Nowy Bieżanów), przeciętnych (Kopiec Wandy, Krowodrza Górka, Bronowice Małe, Salwator), lub wyższych (Walcownia, Borek Fałęcki, Kurdwanów, Mały Płaszów). Część tej zależności widzieliśmy w rankingach przystanków.
+  
+  - Sąsiadujące przystanki mają podobne średnie spóźnienia, co świadczy o sporej korelacji pomiędzy nimi.
+  Przyjrzyjmy się korelacji bliżej.
+```{r delay autocorrelation}
+acf_prep <- report %>% group_by(tripId) %>% arrange(tripId, seq_num) %>%
+  rename(ord0 = stopName, delay0 = delay) %>%
+  mutate(ord1 = lead(ord0, n = 1), delay1 = lead(delay0, n = 1), #determinig consecutive stops andtheir delays
+        ord2 = lead(ord0, n = 2), delay2 = lead(delay0, n = 2),
+         ord3 = lead(ord0, n = 3), delay3 = lead(delay0, n = 3),
+         ord4 = lead(ord0, n = 4), delay4 = lead(delay0, n = 4),
+         ord5 = lead(ord0, n = 5), delay5 = lead(delay0, n = 5)) %>%
+  ungroup() %>%
+  select(ord0, ord1, ord2, ord3, ord4, ord5, delay0, delay1, delay2, delay3, delay4, delay5) %>%
+  group_by(ord0, ord1, ord2, ord3, ord4, ord5) %>% #grouping by 6 element paths
+  group_by(N = n(), add = TRUE) %>% #number of departures on every path
+  summarise_all(.funs = mean, na.rm = TRUE) %>% ungroup() %>% 
+  #filtering for full paths only
+  filter(!is.na(ord5)) %>%
+  #Because there are missing observations in report, there are paths with missed stops in our set. Below, I filter for existing paths only.
+  inner_join(routes[c('from', 'to')], by = c('ord0' = 'from', 'ord1' = 'to')) %>% 
+  inner_join(routes[c('from', 'to')], by = c('ord1' = 'from', 'ord2' = 'to')) %>%
+  inner_join(routes[c('from', 'to')], by = c('ord2' = 'from', 'ord3' = 'to')) %>%
+  inner_join(routes[c('from', 'to')], by = c('ord3' = 'from', 'ord4' = 'to')) %>%
+  inner_join(routes[c('from', 'to')], by = c('ord4' = 'from', 'ord5' = 'to'))
+
+
+corrs <- acf_prep %>% 
+  summarize(ac0 = as.numeric(weights::wtd.cors(acf_prep$delay0, acf_prep$delay0, weight = acf_prep$N)),
+            ac1 = as.numeric(weights::wtd.cors(acf_prep$delay0, acf_prep$delay1, weight = acf_prep$N)),
+            ac2 = as.numeric(weights::wtd.cors(acf_prep$delay0, acf_prep$delay2, weight = acf_prep$N)),
+            ac3 = as.numeric(weights::wtd.cors(acf_prep$delay0, acf_prep$delay3, weight = acf_prep$N)),
+            ac4 = as.numeric(weights::wtd.cors(acf_prep$delay4, acf_prep$delay0, weight = acf_prep$N)),
+            ac5 = as.numeric(weights::wtd.cors(acf_prep$delay5, acf_prep$delay0, weight = acf_prep$N))) %>% gather()
+
+ggplot(corrs, aes(x = c(0:5), y = value)) + geom_line(linetype = 2, size = 1.5) + geom_point(size = 3, color = swatch()[7]) +
+  geom_text(aes(label = round(value, 2)), nudge_y = -0.05) + 
+  labs(title = "Ważone autokorelacje spóźnień pomiędzy przystankami", x = '', y = '') + 
+  coord_cartesian(ylim = c(0, 1))
+```
+  <p style="background-color: #e2e2e2"> Ten wykres powstał następująco: wziąłem wszystkie fragmenty tras o długości 6 przystanków i wyliczyłem średnie spóźnienia na wszystkich przystanków na ścieżce. Następnie wyznaczyłem korelacje między średnimi spóźnieniami na pierwszym i drugim przystanku ścieżki, pierwszym i trzecim itd. Przy liczeniu korelacji każdemu fragmentowi nadawałem wagę równą liczbie zarejestrowanych na niej przejazdów.</p>
+  
+  - Tramwaje nadrabiają spóźnienia! Na mapce można zauważyć, że po najmocniej *czerwonych* odcinkach, oznaczających wzrost spóźnienia, często występują mocno *niebieskie*, oznaczające spadek. Zobaczmy tę zależność na wykresie.
+```{r, fig.asp=1, out.width='70%'}
+incr_param <- report %>% group_by(tripId) %>% arrange(tripId, seq_num) %>% 
+  transmute(from = lag(stopName),
+         by = stopName,
+         to = lead(stopName), 
+         delay_inc_prev = delay - lag(delay),
+         delay_inc_con = lead(delay) - delay) %>% 
+  ungroup() %>% select(-tripId) %>% 
+  inner_join(unique(select(line_routes_directed, -number, -direction, -name)), 
+            by = c('from', 'by', 'to')) %>% 
+  group_by(from, by, to, longitude, latitude) %>% group_by(N = n(), add = TRUE) %>% 
+  filter(!is.na(delay_inc_prev) & !is.na(delay_inc_con))
+
+incr_param %>% summarise_all(mean) %>% 
+ggplot(aes(delay_inc_prev, delay_inc_con)) + 
+  geom_hline(aes(yintercept = 0), linetype = 2, color = swatch()[7]) + 
+  geom_vline(aes(xintercept = 0), linetype = 2, color = swatch()[7]) +
+  geom_point() + 
+  geom_smooth(method = 'loess') + 
+  scale_x_continuous(limits = c(-1, 1)) + coord_cartesian(xlim = c(-1, 1), ylim = c(-1, 1), expand = c(0,0)) + 
+  labs(x = 'Średni przyrost spóźnienia przed przystankiem', y = 'Średni przyrost spóźnienia po przystanku')
+```
+  <p style="background-color: #e2e2e2:> Jak czytać ten wykres? Przypuśćmy, że przy Filharmonii tramwaj nie miał opóźnienia. Na następnym przystanku, Jubilat, dojechał jednak z dwuminutowym opóźnieniem. Potem udało mu się nadrobić część spóźnienia i na Komorowskiego przyjechał spóźniony minutę. Dla przystanku Jubilat przyrost opóźnienia przed przystankiem wyniósł 2 minuty (od 0 do 2), a po przystanku -1 minutę (od 2 do 1). Taka historia zostałaby w powyższym układzie współrzędnych zaznaczona w punkcie (2, -1). Wykres powstał przez wzięcie średnich z takich sekwencji dla każdego przystanku. Jeżeli na jakimś przystanku dochodziło do rozwidlenia, to wszystkie ścieżki były liczone osobno. </p>
+  W prawej części wykresu średnia spada poniżej 0, czyli po odcinkach o dużym przyroście spóźnienia następują te z ujemnym przyrostem (spadkiem). Niestety rzadko udaje się nadrobić całe spóźnienie: większość punktów znajduje się powyżej przekątnej (przekątna odpowiada sytuacjom w których tramwaj nadrabia tyle ile wcześniej stracił)
+   - Oprócz fragmentów z dużymi wahaniami warto zwrócić uwagę na fragmenty, gdzie tramwaje przez dłuższy odcinek łapią nieduże spóźnienia, ale mają ich gdzie nadrobić. Najwięcej takich miejsc leży w obszarze pomiędzy przystankami Stradom, Św. Gertrudy, Dworzec Główny, Rondo Mogilskie, Rondo Grzegórzeckie. Choć niektóre przyrosty są bardzo małe, to w całym tym obszarze tylko na dwóch odcinkach opóźnienie spada. Podobne odcinki to: wyjazd z Borku Fałęckiego, od Sanktuarium Bożego Miłosierdzia do Smolki, przejazd Aleją Pokoju od Ronda Czyżyńskiego do Grzegórzeckiego, połączenie Dworca Towarowego ze Starym Kleparzem, czy odcinek od Placu Wolnica do Dworca Płaszów. 
+  
+
+# Analiza pojedynczych linii
+
+Dotychczas w różnych statystykach korzystałem ze średniej. Można by się zastanowić, czy wobec asymetrii rozkładu nie lepiej byłoby użyć mediany. Na drodze stanęły zaokrąglenia pomiarów. Ponieważ rozkłady są układane z dokładnością do jednej minuty, z taką też dokładnością mierzyłem spóźnienia. Jedynymi możliwymi wartościami mediany były więc 0, 0.5, 1, 1.5 itd. (przy czym przy takiej liczbie danych wartości niecałkowite były mało prawdopodobne). W takiej sytuacje stosunkowo duże różnice w rozkładach pozostawałyby niezauważalne.
+
+Poniżej będę pokazywał zależność spóźnień od miejsca na trasie i pory dnia, dla wszystkich linii. W takim przedsięwzięciu użycie mediany (czy ogólniej kwantyli) ma dodatkowe przewagi, które warto wykorzystać, a o których napiszę niżej. Jednak przy takich zaokrągleniach ciężko było dopasować szczegółowe modele, więc dodałem do spóźnień jednorodny (i ucięty w zerze) szum. Tak wyglądają dane dla linii 52 w kierunku Osiedla Piastów, w rozbiciu na przystanki, po takiej obróbce.
+
+```{r Subsetting, echo=TRUE}
+df52 <- dplyr::filter(report, number == 52, direction == 'Os.Piastów')
+df52$delay <- jitter(as.numeric(df52$delay), amount = 0.5)
+df52$delay[df52$delay < 0] <- 0
+```
+
+```{r Basic plots}
+ggplot(df52, aes(seq_num, delay)) + geom_point(alpha = 0.2) + 
+  labs(title = 'Linia: 52 | Kierunek: Os. Piastów', subtitle = "Spóźnienia na poszczególnych przystankach", x = "", y = "Spóźnienie w minutach") + 
+  scale_x_discrete(limits = c(1:34), labels = df52 %>% arrange(seq_num) %>% `$`(stopName) %>% unique()) + 
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(0, 0, 0, -1)),
+        axis.title.x = element_blank())
+```
+
+Na wykresie jest zbyt dużo punktów, żeby był czytelny, więc dobrze byłoby użyć jakiś statystyk do opisania tych spóźnień. I tutaj lepiej sprawdzą się kwantyle niż średnia. Ponieważ ciężko zidentyfikować i sparametryzować rozkład, sama średnia niewiele nam powie o tym jak spóźnienia się układają. Jeżeli na przykład ktoś ma trzy minuty na przesiadkę i zastanawia się, czy tramwaj nie spóźni się na tyle, żeby mu ją uniemożliwić, to sama średnia nie daje informacji o prawdopodobieństwie odpowiednio małego spóźnienia. Przy pomocy dopasowanych kwantyli możemy zaś to prawdopodobieństwo oszacować.
+
+Zobaczmy więc kwantyle spóźnień na poszczególnych przystankach.
+
+```{r quantiles data frame, echo=TRUE}
+df52_quantiles <- df52 %>% group_by(seq_num) %>% 
+  summarize(`0.2` = quantile(delay, probs = 0.2),
+            `0.3` = quantile(delay, probs = 0.3),
+            `0.4` = quantile(delay, probs = 0.4),
+            `0.5` = quantile(delay, probs = 0.5),
+            `0.6` = quantile(delay, probs = 0.6),
+            `0.7` = quantile(delay, probs = 0.7),
+            `0.8` = quantile(delay, probs = 0.8),
+            `0.9` = quantile(delay, probs = 0.9))
+
+```
+
+```{r quantiles plot}
+ggplot(df52_quantiles, aes(x = seq_num)) +
+      geom_ribbon(aes(ymin = `0.2`, ymax = `0.9`), alpha = 0.25) +
+      geom_ribbon(aes(ymin = `0.2`, ymax = `0.8`), alpha = 0.3) +
+      geom_ribbon(aes(ymin = `0.3`, ymax = `0.7`), alpha = 0.4) +
+      geom_ribbon(aes(ymin = `0.4`, ymax = `0.6`), alpha = 0.5) +
+      geom_line(aes(y = `0.5`), color = swatch()[7], size = 2) +
+      geom_text(data = data.frame(x = rep(33.4, 8),
+                                   y = as.numeric(df52_quantiles[34, -1]),
+                                   label = seq(0.2, 0.9, 0.1)),
+                 aes(x = x, y = y, label = paste0(100*label, '%'))) + 
+      labs(title = 'Linia: 52 | Kierunek: Os. Piastów', 
+           subtitle = "Kwantyle spóźnień na poszczególnych przystankach", 
+           x = "", y = "Spóźnienie w minutach") + 
+      scale_x_discrete(limits = c(1:34), 
+                       labels = df52 %>% arrange(seq_num) %>% `$`(stopName) %>% unique()) + 
+      theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(0, 0, 0, -1)),
+            axis.title.x = element_blank())
+```
+
+Żeby zrozumieć jak czytać taki wykres przypatrzmy się na przykład przystankowi Dunikowskiego (trzeci od końca). Linia podpisana 80% znajduje się na wysokości 2 minut. Oznacza to, że na Dunikowskiego 80% tramwajów spóźnia się mniej niż 2 minuty. Jeżeli chcemy spóźnić się mniej niż minutę, to mamy mniej więcej 60% szans na powodzenie itd.
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+Powyższy wykres możemy potraktować jako ilustrację pewnego modelu regresji kwantylowej. Tak jak w prostej regresji liniowej szacujemy warunkową średnią minimalizując kwadraty błędów $\sum_{i=1}^{n} (y_i - x_i^T\beta)^2$, tak w dopasowując medianę minimalizujemy wartości bezwzględne (a właściwie połowy wartości bezwzględnych) błędów ($\sum_{i=1}^{n} \frac{1}{2}|y_i - x_i^T\beta|$), a w przypadku innych kwantyli obkładamy sumowane błędy funkcją $\rho_\tau(\epsilon) = \epsilon(\tau - \mathbb{1}_{\epsilon < 0})$ dla kwantylu $\tau$ ($\rho_{\frac{1}{2}}(x) = \frac{1}{2}|x|$, co jednak nie zmienia minimum). Istnieją też algorytmy pozwalające dopasowywać modele addytywne, transformując zmienne objaśniące w zależności od kształtu danych.
+
+W powyższym modelu kwantyle zostały dopasowane do każdego przystanku osobno, czyli jakby do jednej zmiennej kategorycznej z 34 poziomami. Sprawdźmy dopasowanie tego modelu, w szczególności czy *ostre* różnice pomiędzy sąsiednimi przystankami nie świadczą o naddopsaowaniu (overfittingu).
+
+Jeżeli dany kwantyl, powiedzmy 0.6 jest dobrze dopasowany, to 60% wszystkich obserwacji powinno się znajdować poniżej wyznaczonej przez niego krzywej. Albo inaczej rzecz ujmując, 60% reszt modelu (różnic pomiędzy wartością zmierzoną, a dopasowaną) powinno być mniejszych od 0. Jak to wygląda w naszym modelu?
+
+```{r fit checking, echo=TRUE}
+  resids <- df52 %>% select(seq_num) %>% left_join(df52_quantiles, by = 'seq_num')
+  resids[, -1] <- df52$delay - resids[, -1] < 0
+  
+  resids %>% summarize_at(2:9, mean) %>% cbind(`Miało być` = c('Wyszło'), .) %>% 
+  kable(digits = 2) %>% kable_styling(bootstrap_options = 'responsive', font_size = 12)
+```
+
+Kwantyle od 0.2 do 0.4 zdają się być dziwnie zaniżone. Póki co zaostrzmy nasze kryterium. Nie tylko 60% wszystkich reszt powinno być mniejsze od 0, ale powinno tak być dla każdego przystanku. Tym razem zobaczmy dopasowanie na wykresie:
+
+```{r fit checking plot, echo=TRUE}
+  resids %>% group_by(seq_num) %>% summarize_all(mean) %>% gather(quantile, val, -seq_num) %>% 
+    ggplot(aes(seq_num, val, color = quantile)) + geom_line() + facet_grid(quantile ~ .) + 
+    labs(x = 'Numer przystanku na trasie', y = 'Wyliczona wartość') + theme(legend.position = 'None')
+```
+
+Dopasowanie jest bardzo dobre poza kilkoma miejscami, gdzie niskie kwantyle lądują w 0. Możemy jednak zauważyć, że są to te miejsca, w których są one równe 0. Jasne więc, że nie ma żadnych obserwacji poniżej. Ogółem należy stwierdzić, że kwantyle są dopasowane tam, gdzie być powinny.
+
+Czy jednak tak duże rozbicie nie powoduje, że taki model byłby niewiarygodny dla nowych danych? Poniższe tabela i wykres przedstawiają wyniki testowania krzyżowego w takiej formie jak tabela i wykres powyżej. 
+
+```{r first cross vaidation, echo=TRUE}
+set.seed(52)
+df_cv <- cbind(df52, part = sample(1:5, nrow(df52), replace = TRUE))
+
+output_cv <- list()
+kstest_cv <- list()
+
+  for(i in c(1:5)){
+    train <- df_cv[df_cv$part != i, ] #splitting
+    test <- df_cv[df_cv$part == i, ]
+                           
+    kstest_cv[[i]] <- sapply(1:34, function(x) ks.test(train[train$seq_num == x, ]$delay,
+                                                       test[test$seq_num == x, ]$delay)$p.value)
+      
+    cv_quantiles <- train %>% group_by(seq_num) %>% #Quantiles are fitted for train part only
+      summarize(`0.2` = quantile(delay, probs = 0.2),
+                `0.3` = quantile(delay, probs = 0.3),
+                `0.4` = quantile(delay, probs = 0.4),
+                `0.5` = quantile(delay, probs = 0.5),
+                `0.6` = quantile(delay, probs = 0.6),
+                `0.7` = quantile(delay, probs = 0.7),
+                `0.8` = quantile(delay, probs = 0.8),
+                `0.9` = quantile(delay, probs = 0.9))
+
+    test_resids <- test %>% select(seq_num) %>% left_join(cv_quantiles, by = 'seq_num') #in this line: fitted values
+    test_resids[, -1] <- test$delay - test_resids[, -1] < 0
+    
+    output_cv[[i]] <- cbind(part = i, test_resids)
+  }
+
+output_cv <- do.call(rbind, output_cv)
+```
+
+```{r plotting cv}
+output_cv %>% gather(key = quantile, value = val, -part, -seq_num) %>% 
+  group_by(part, quantile) %>% summarize(val = mean(val)) %>% 
+  spread(key = quantile, value = val) %>% kable(digits = 3) %>% kable_styling(bootstrap_options = 'responsive', font_size = 12)
+
+output_cv %>% gather(key = quantile, value = val, -part, -seq_num) %>% 
+  group_by(part, quantile, seq_num) %>% summarize(val = mean(val)) %>%
+  ggplot(aes(seq_num, val, group = as.factor(part), color = as.factor(part))) + geom_line() + 
+    facet_grid(quantile ~ ., scale = 'free_y', space = 'fixed') + 
+  labs(y = 'Kwantyl na zbiorze testowym', x = 'Numer przystanku na trasie') + 
+    scale_color_discrete(name = 'Partia testowa')
+```
+Zbiór został losowo podzielony na 5 części. Na czterech zostały policzone kwantyle, porównane potem z kwantylami piątego. Każda z pięciu części raz pełniła rolę testowej.
+
+Na wykresie widzimy, że żadna z partii testowych nie odstaje na dłuższym odcinku od pozostałych. Różnice pomiędzy kwantylami na zbiorze treningowym i testowym sięgają lokalnie 0.1. Czy to dużo czy mało? W tym modelu każdy przystanek był dopasowywany osobno. Możemy założyć, że kwantyle na zbiorze treningowym i testowym nie odbiegają od siebie zanadto, jeżeli na poszczególnych przystankach rozkłady są równe. Równości rozkładów były powyżej sprawdzane testem Kołmogorowa-Smirnowa. Tak się przedstawiają przybliżone p-wartości dla poszczególnych partii testowych w rozbiciu na przystanki
+
+<details><summary> **Kliknij, żeby rozwinąć tabelę ▼** </summary>
+```{r kstest results, echo=FALSE}
+do.call(cbind, kstest_cv) %>% kable(digits = 3, col.names = c(1:5)) %>% kable_styling(bootstrap_options = 'responsive', font_size = 12)
+```
+</details>
+
+W każdej partii tylko jedna albo dwie wartości znajdują się poniżej progu 0.05. Ponieważ $0.05 \cdot 34 = 1.7$ są to wartości których powinniśmy się spodziewać.
+</div>
+
+## Regresja kwantylowa
+
+Dopasujmy teraz modele regresji kwantylowej dla obydwu kierunków, uwzględniające także planowany czas odjazdu i interakcję między tymi zmiennymi. Ponieważ szczegółowe potraktowanie przystanków dobrze się sprawdziło wymusimy szczegółowość przez duży wymiar bazy przestrzeni z której będą dobierane splajny. 
+
+```{r Subsetting2, echo=TRUE}
+df52b <- dplyr::filter(report, number == 52, direction == 'Czerwone Maki P+R')
+df52b$delay <- jitter(as.numeric(df52b$delay), amount = 0.5)
+df52b$delay[df52b$delay < 0] <- 0
+```
+
+```{r quantile reg, echo=TRUE, results='hide'}
+qgam_model_A <- mqgam(delay ~ ti(seq_num, k = 30) + ti(minutefs, k = 8) + ti(seq_num, minutefs), data = df52, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_A, fun = summary)
+
+qgam_model_B <- mqgam(delay ~ ti(seq_num, k = 30) + ti(minutefs, k = 8) + ti(seq_num, minutefs), data = df52b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_B, fun = summary)
+```
+
+Nie wklejam wyników podsumowań modelu, żeby dodatkowo nie wydłużać wpisu, ale można sprawdzić, że wszystkie współczynniki wyszły statystycznie istotne.
+
+Przyjrzyjmy się spóźnieniom w godzinach, w których są one największe.
+
+```{r quantile regression 1 plot}
+resp_plot <- function(mqgamObject, type, seq_num = 10, minutefs = 12*60 + 30){
+  
+  if(type == 'seq_num'){
+  new <- data.frame(seq_num = sort(unique(mqgamObject$model$seq_num)),
+                    minutefs = rep(minutefs, length(unique(mqgamObject$model$seq_num))))
+  }
+  if(type == 'minutefs'){
+      new <- data.frame(seq_num = rep(seq_num, 38),
+                    minutefs = seq(60, 19*60 + 30, 30))
+  }
+  
+  data <- qdo(mqgamObject, fun = predict, newdata = new, type = 'response') %>% as.data.frame()
+  data <- sapply(data, function(col) sapply(col, function(element) max(element, 0))) %>% as.data.frame()
+  names(data) <- names(mqgamObject$fit)
+  
+  if(type == 'seq_num'){
+   plot <- cbind(new, data) %>%
+    ggplot(aes(x = seq_num)) +
+      geom_ribbon(aes(ymin = `0.2`, ymax = `0.9`), alpha = 0.25) +
+      geom_ribbon(aes(ymin = `0.2`, ymax = `0.8`), alpha = 0.3) +
+      geom_ribbon(aes(ymin = `0.3`, ymax = `0.7`), alpha = 0.4) +
+      geom_ribbon(aes(ymin = `0.4`, ymax = `0.6`), alpha = 0.5) +
+      geom_line(aes(y = `0.5`), color = swatch()[7], size = 2) +
+    #Graphical tuning
+      geom_text(data = data.frame(x = rep(nrow(data) -  0.5 , 8),
+                                   y = as.numeric(data[nrow(data), ]),
+                                   label = seq(0.2, 0.9, 0.1)),
+                 aes(x = x, y = y, label = paste0(100*label, '%'))) + 
+      labs(title = 
+            paste('Linia:', mqgamObject$data$number[1], 
+                  '| Kierunek:', mqgamObject$data$direction[1]), 
+          subtitle = "Dopasowane kwantyle spóźnień", 
+           x = "", y = "Spóźnienie w minutach") +
+      theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(0, 0, 0, -1)),
+            axis.title.x = element_blank()) + 
+      scale_x_discrete(limits = 1:max(new$seq_num),
+                       labels = mqgamObject$data %>% arrange(seq_num) %>% `$`(stopName) %>% unique())
+  }
+  
+  if(type == 'minutefs'){
+   plot <- cbind(new, data) %>%
+    ggplot(aes(x = minutefs)) +
+      geom_ribbon(aes(ymin = `0.2`, ymax = `0.9`), alpha = 0.25) +
+      geom_ribbon(aes(ymin = `0.2`, ymax = `0.8`), alpha = 0.3) +
+      geom_ribbon(aes(ymin = `0.3`, ymax = `0.7`), alpha = 0.4) +
+      geom_ribbon(aes(ymin = `0.4`, ymax = `0.6`), alpha = 0.5) +
+      geom_line(aes(y = `0.5`), color = swatch()[7], size = 2) +
+    #Graphical tuning
+      geom_text(data = data.frame(x = rep(1140 , 8),
+                                   y = as.numeric(data[nrow(data), ]),
+                                   label = seq(0.2, 0.9, 0.1)),
+                 aes(x = x, y = y, label = paste0(100*label, '%'))) + 
+     labs(title = 
+            paste('Linia:', mqgamObject$data$number[1], 
+                  '| Kierunek:', mqgamObject$data$direction[1], 
+                  '| Przystanek:',  (mqgamObject$data %>% select(seq_num, stopName) %>% arrange(seq_num) %>% unique())$stopName[seq_num]), 
+          subtitle = "Dopasowane kwantyle spóźnień", 
+           x = "", y = "Spóźnienie w minutach") + 
+      theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(0, 0, 0, -1)),
+            axis.title.x = element_blank()) +  
+      scale_x_continuous(breaks = seq(60, 19*60, 120), 
+                       labels = paste0(seq(5, 23, 2), rep(":00", 9)))
+  }
+  plot
+}
+```
+
+```{r}
+resp_plot(qgam_model_A, type = 'seq_num') + coord_cartesian(ylim = c(0, 5)) + 
+  labs(title = 'Linia: 52 | Kierunek: Os. Piastów | Godzina: 16:30')
+
+resp_plot(qgam_model_B, type = 'seq_num', minutefs = 6*60) + coord_cartesian(ylim = c(0, 5)) +
+  labs(title = 'Linia: 52 | Kierunek: Czerwone Maki P+R | Godzina: 10:00')
+```
+
+W obydwu kierunkach początkowe spóźnienia są bardzo małe, z kilkoma odstającymi przystankami. Potem następuje rozłożony na kilka odcinków wzrost opóźnień i ich rozpiętości. Co ciekawe, w obydwu kierunkach odbywa się to na podobnym odcinku - między Stradomiem, a Cystersów/Lubicz - który wcześniej wskazaliśmy jako jedno z miejsc gdzie występują małe, ale następujące bez przerwy przyrosty spóźnień.
+
+W kilku miejscach na trasie następują krótkie skoki spóźnień. Dobrze byłoby sprawdzić ich źródła w terenie. Mogą to być np. niekorzystne usytuowanie przystanku względem sygnalizacji świetlnej (podwójne czekanie: najpierw na sygnalizacji, potem na przystanku; dotyczy przystanków Chmieleniec, Norymberska, Kleeberga), trudności ze sprawnym przejazdem przez węzeł komunikacyjny (Centrum Kongresowe ICE, DH Wanda), czy zły stan torowiska (Muzeum Lotnictwa).
+
+Przyjrzyjmy się ja wyglądały spóźnienia na Stradomiu i na Cystersów w zależności od godziny.
+
+<details> <summary style="text-align:center;"> **▼ Stradom ▼**</summary>
+```{r}
+plot_a <- resp_plot(qgam_model_A, type = 'minutefs', seq_num = 14) + 
+  coord_cartesian(ylim = c(0, 4.3)) + 
+labs(title = 'Linia: 52 | Przystanek: Stradom', subtitle = 'Kierunek: Os. Pisatów')
+
+plot_b <- resp_plot(qgam_model_B, type = 'minutefs', seq_num = 22) + 
+  coord_cartesian(ylim = c(0, 4.3)) + 
+  labs(title = '', subtitle = 'Kierunek: Czerwone Maki P+R')
+
+ggarrange(plot_a, plot_b, ncol = 2)
+```
+</details>
+
+<details> <summary style="text-align:center;"> **▼ Cystersów ▼**</summary>
+```{r}
+plot_c <- resp_plot(qgam_model_A, type = 'minutefs', seq_num = 20) + 
+  coord_cartesian(ylim = c(0, 4.7)) + 
+labs(title = 'Linia: 52 | Przystanek: Cystersów', subtitle = 'Kierunek: Os. Pisatów')
+
+plot_d <- resp_plot(qgam_model_B, type = 'minutefs', seq_num = 16) + 
+  coord_cartesian(ylim = c(0, 4.7)) + 
+  labs(title = '', subtitle = 'Kierunek: Czerwone Maki P+R')
+
+ggarrange(plot_c, plot_d, ncol = 2)
+```
+</details>
+
+Ciekawe, że w stronę Czerwonych Maków szczyt występuje rano, a w stronę Osiedla Piastów po południu. Przynajmniej na tych dwóch przystankach, bo na całej trasie zależność ta jest jeszcze bardziej interesująca.
+
+```{r}
+many_median <- function(mqgamObject){
+  new <- expand.grid(seq_num = unique(mqgamObject$model$seq_num),
+                    minutefs = seq(60, 18*60 + 30, 30))
+  
+  data <- qdo(mqgamObject, fun = predict, newdata = new, type = 'response', qu = 0.5) %>% as.data.frame()
+  data <- sapply(data, function(col) sapply(col, function(element) max(element, 0))) %>% as.data.frame()
+  names(data) <- 0.5
+  
+   cbind(new, data) %>% group_by(seq_num) %>% 
+     mutate(`0.5` = (`0.5` - min(`0.5`))/(max(`0.5`) - min(`0.5`))) %>% ungroup() %>% 
+     ggplot(aes(x = factor(minutefs),
+                y = -seq_num + max(seq_num + 1),
+                fill = `0.5`)) + geom_tile() + 
+      scale_y_discrete(limits = max(new$seq_num):1,
+                       labels = mqgamObject$data %>% arrange(seq_num) %>% `$`(stopName) %>% unique()) + 
+   scale_x_discrete(breaks = seq(60, 18*60 + 30, 240), labels = c('5:00', "9:00", "13:00", "17:00", "21:00")) + viridis::scale_fill_viridis() + 
+   theme(panel.grid.major = element_line(colour = NA), 
+    panel.grid.minor = element_line(colour = NA), 
+    panel.background = element_rect(fill = NA), 
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()) + 
+  labs(title = paste('Linia:', mqgamObject$data$number[1], '| Kierunek:', mqgamObject$data$direction[1]), subtitle = "Przeskalowana mediana spóźnień o różnych godzinach")
+  }
+
+many_median(qgam_model_A)
+many_median(qgam_model_B)
+```
+
+Ponieważ różnice w przeciętnych spóźnieniach pomiędzy przystankami są znacznie większe niż pomiędzy różnymi porami dnia, mediana została przeskalowana do wartości [0,1]. Inaczej mówiąc, wykresy powyżej powstały jakby przez przeklejenie samych tylko kolorów z wykresów takich jak ten poniżej, zrobionych dla każdego przystanku osobno:
+
+```{r, out.height='50%'}
+new <- data.frame(seq_num = rep(17, 36),
+                    minutefs = seq(60, 18*60 + 30, 30))
+
+qdo(qgam_model_A, fun = predict, newdata = new, qu = 0.5) %>% cbind(delay = ., new) %>% 
+  ggplot(aes(x = minutefs, y = 0, height = delay)) + ggridges::geom_ridgeline_gradient(aes(fill = delay), size = 0) + viridis::scale_fill_viridis() + 
+   scale_x_continuous(breaks = seq(60, 18*60 + 30, 240), labels = c('5:00', "9:00", "13:00", "17:00", "21:00")) + labs(title = 'Linia: 52 | Kierunek: Os. Piastów | Przystanek: Dworzec Główny', x = '', y = '', subtitle = 'Mediana spóźnień') + theme(legend.position = 'none')
+```
+
+Najbardziej uderza oczywiście, że szczyt popołudniowy zaczyna się na trasie do Czerwonych Maków gdzieś między Rondem Mogilskim, a Dworcem Głównym. Na poprzednich przystankach spóźnienia ok. 17:00 nie odstają tak mocno. W drugą stronę taka sytuacja ma z kolei miejsce rano, choć kontrast nie jest tak wyraźny. Interesujące byłoby porównanie tych wyników z danymi o przepływie pasażerów.
+
+Na koniec jedna obserwacja na temat porannego szczytu spóźnień. Przyszło mi do głowy następujace wyjaśnienie faktu, że występuje on później niż zwczajowo kojarzony poranny szczyt komunikacyjny: ok. 10 tramwaje mają bardziej wyśrubowane rozkłady, ale ruch nie zamiera aż tak szybko. Bardzo łatwo było tą hipotezę obalić: planowane czasy przejazdów pomiędzy przystankami generalnie nie różnią się w ciągu dnia (ewentualnie na niektórych odcinkach, późno w nocy).
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+### Diagnostyka modelu
+
+Za pomocą poniższej funkcji będę sprawdzał brzegowe dopasowania modeli. Jest to pewien ersatz dla wykresów robaczkowych (worm plotów), fantastycznego narzędzia od analizy modeli regresji kwantylowej, którego tu nie udało się zastosować ze względu na pokrywające się dolne kwantyle. Pokolorowany obszar odpowiada przedziałowi $\pm$ 10 sekund. 
+
+Idealnie kolorowe linie, oznaczające kwantyle na poszczególnych przystankach lub przedziałach czasowych, pokrywałyby się z kwantylami wziętymi z modelu, oznaczonymi przez czarne przerywane linie. Jeżeli linia kolorowa pokazuje np. 0.57, a czarna 0.5, to znaczy, że wartość która w modelu została wyliczona jako mediana tak naprawdę odpowiada wyższemu kwantylowi (jest zawyżona). Odwrotnie, jeżeli kolorowa linia znajduje się pod czarną, to model zaniża w wartość w tamtym miejscu.
+
+Wartości dla godzin są uśredniane do przedziałów jednogodzinnych. Przystanki są liczone pojedynczo.
+
+```{r fit plot definition, echo=TRUE}
+fit_plot <- function(mqgamObject, type){
+  tau <- as.numeric(names(mqgamObject$fit))#used quantiles
+
+  resids <- qdo(mqgamObject, fun = residuals, type = 'response') %>%
+    as.data.frame()#model residuals
+  
+  if(type == 'seq_num'){
+    explan <- mqgamObject$data$seq_num 
+    subtitle <- 'Dopasowanie względem numeru przystanku'
+    xlab <- 'Numer przystanku na trasie'
+  }
+  if(type == 'minutefs'){
+    explan <- hour(round_date(mqgamObject$data$plannedTime, unit = 'hours'))
+    subtitle <- 'Dopasowanie względem numeru godziny'
+    xlab <- 'Godzina'
+  }
+  
+  est <- as.data.frame(resids <= 0)#proportion of values below fitted quantile. Ideally will equal quantile value
+  names(est) <- tau
+  
+  est <- cbind(explan, est) %>%
+    group_by(explan) %>% 
+    summarise_all(funs(mean)) %>% #proportion of residuals under 0
+    gather(key = 'quantile', value = 'est', -explan)
+
+  upper <- as.data.frame(resids <= 1/6) # 10secs upper tolerance
+  names(upper) <- tau
+  upper <- cbind(explan, upper) %>%
+    group_by(explan) %>% summarise_all(funs(mean)) %>%
+    gather(key = 'quantile', value = 'upper', -explan)
+
+  lower <- as.data.frame(resids <= -1/6)
+  names(lower) <- tau
+  lower <- cbind(explan, lower) %>%
+    group_by(explan) %>% summarise_all(funs(mean)) %>%
+    gather(key = 'quantile', value = 'lower', -explan)
+
+  data <- left_join(est, upper, by = c('explan','quantile')) %>%
+    left_join(lower, by = c('explan', 'quantile'))
+
+  ggplot(data, aes(x = explan, y = est, ymin = lower, ymax = upper)) +
+    geom_line(aes(color = quantile)) + geom_ribbon(alpha = 0.2) +
+    geom_hline(aes(yintercept = as.numeric(quantile)), color = swatch()[1], linetype = 2) +
+    facet_grid(quantile ~ ., scales = 'free_y') + 
+    scale_x_discrete(limits = sort(explan)) + 
+    theme(legend.position = 'none') + 
+    labs(title = paste('Linia:', mqgamObject$data$number[1], '| Kierunek:', mqgamObject$data$direction[1]), subtitle = subtitle, x = xlab, y = 'Empiryczne kwantyle') 
+}
+```
+
+```{r}
+fit_plot(qgam_model_A, 'seq_num') 
+fit_plot(qgam_model_A, 'minutefs')
+fit_plot(qgam_model_B, 'seq_num')
+fit_plot(qgam_model_B, 'minutefs')
+```
+
+W regresji kwantylowej istnieje stosuje się funkcję $R^1(\tau)$, odpowiednik współczynnika $R^2$ w regresji liniowej. Definiuje się ją jako $1 - \frac{\hat{V}}{V}$, gdzie $\hat{V}$ oznacza sumę wartości funkcji $\rho$ na resztach modelu (funkcję kosztu modelu), a $V$ sumę wartości funkcji $\rho$ na różnicach między wartościami zmiennej objaśnianej, a jej kwantylami (funkcja kosztu modelu z samym wyrazem wolnym).
+
+```{r R1, echo=TRUE}
+rho <- function(u, tau) u*(tau - (u < 0))
+
+R1 <- function(mqgamObject){
+
+  tau <- as.numeric(names(mqgamObject$fit))
+  output <- numeric(length(tau))
+  names(output) <- names(mqgamObject$fit)
+  
+  sample_quantiles <- quantile(mqgamObject$model$delay, probs = tau) %>% t() %>% as.data.frame()
+  null_residuals <- sapply(sample_quantiles, function(x) mqgamObject$model$delay - x) %>% as.data.frame()
+  
+  #extracted <- qdo(mqgamObject, fun = predict, type = 'response')
+  
+  for(i in seq_along(tau)){
+  Vhat <- sum(rho(mqgamObject$model$delay - mqgamObject$fit[[i]]$fitted.values, tau[i]))
+  V <- sum(rho(null_residuals[[i]], tau[i]))
+  output[i] <- 1-Vhat/V
+    }
+  output
+}
+```
+
+```{r}
+pander::pander("Linia: 52 | Kierunek: Os. Piastów | R1")
+R1(qgam_model_A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+pander::pander("Linia: 52 | Kierunek: Os. Piastów | R1")
+R1(qgam_model_B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+
+Zależność od położenia na trasie i pory dnia rośnie wraz z kwantylami. Najprostsza interpretacja tej obserwacji jest taka, że wraz ze zmianami położenia na trasie i godziny zwiększa się *rozstrzał* spóźnień.
+
+Niskie wartości w kwantylach 0.2 i 0.3 mogą wynikać z błędów obliczeniowych spowodowanych pokrywaniem się niskich kwantyli.
+</div>
+
+
+## Pozostałe linie
+<details><summary> Rozwiń ▼ </summary>
+
+W dalszej części pracy będę umieszczał same tylko wykresy, bez komentarza. Wszystkie wykresy spóźnienia względem przystanków są ustawione na 16:30.
+
+Wydzielmy najpierw zbiory do modelowania poszczególnych linii.
+```{r bigsubsetting, echo=TRUE}
+lines <- unique(line_ranking$number)
+
+lin_dir_asgn <- function(x){
+  dirs <- filter(line_ranking, number == x) %>% `$`(direction)
+  
+  a <- dplyr::filter(report, number == x, direction == dirs[[1]])
+  a$delay <- jitter(as.numeric(a$delay), amount = 0.5)
+  a$delay[a$delay < 0] <- 0
+  
+  b <- dplyr::filter(report, number == x, direction == dirs[[2]])
+  b$delay <- jitter(as.numeric(b$delay), amount = 0.5)
+  b$delay[b$delay < 0] <- 0
+  
+  assign(paste0('df', x, 'a'), a, pos = 1)
+  assign(paste0('df', x, 'b'), b, pos = 1)
+  
+  return(NULL)
+}
+
+purrr::walk(lines, lin_dir_asgn)
+```
+
+W przypadku linii 52 wymiar bazy spaljnów był dobrany na podstawie cross-validacji modelu z przystankami jako zmienną jakościową. Dla następnych linii przyjąłem inną strategię. Ponieważ przeprowadzenie tak wielu testów trawłoby zbyt długo dla każdej linii podiz zbiór na część testową i trenigową, a następnie sprawdziłem wartość funkcji kosztu dla różnych wymiarów bazy. W przypadkach spornych (różne wyniki dla róznych kwantyli) decydowałem na podstawie wykresów dopasowań brzegowych. Wyniki modelowanie poniżej:
+
+<ul>
+<li><a href="#linia-1">Linia 1</a></li>
+<li><a href="#linia-2">Linia 2</a></li>
+<li><a href="#linia-3">Linia 3</a></li>
+<li><a href="#linia-4">Linia 4</a></li>
+<li><a href="#linia-5">Linia 5</a></li>
+<li><a href="#linia-6">Linia 6</a></li>
+<li><a href="#linia-8">Linia 8</a></li>
+<li><a href="#linia-9">Linia 9</a></li>
+<li><a href="#linia-10">Linia 10</a></li>
+<li><a href="#linia-11">Linia 11</a></li>
+<li><a href="#linia-13">Linia 13</a></li>
+<li><a href="#linia-14">Linia 14</a></li>
+<li><a href="#linia-16">Linia 16</a></li>
+<li><a href="#linia-18">Linia 18</a></li>
+<li><a href="#linia-19">Linia 19</a></li>
+<li><a href="#linia-20">Linia 20</a></li>
+<li><a href="#linia-21">Linia 21</a></li>
+<li><a href="#linia-22">Linia 22</a></li>
+<li><a href="#linia-24">Linia 24</a></li>
+<li><a href="#linia-44">Linia 44</a></li>
+<li><a href="#linia-50">Linia 50</a></li>
+</ul></li>
+
+### Linia 1
+```{r linia 1 modele, echo=TRUE, results='hide'}
+qgam_model_1A <- mqgam(delay ~ ti(seq_num, k = 27) + ti(minutefs, k = 7) + ti(seq_num, minutefs), data = df1a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_1A, fun = summary) #hidden because of lenght
+
+qgam_model_1B <- mqgam(delay ~ ti(seq_num, k = 27) + ti(minutefs, k = 8) + ti(seq_num, minutefs), data = df1b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_1B, fun = summary) #hidden because of lenght
+```
+
+```{r linia 1 resp_plot}
+resp_plot(qgam_model_1A, type = 'seq_num') +
+  labs(title = 'Linia: 1 | Kierunek: Salwator | Godzina: 16:30')
+
+resp_plot(qgam_model_1B, type = 'seq_num')
+```
+
+
+```{r linia 1 heatmap}
+many_median(qgam_model_1A)
+many_median(qgam_model_1B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r linia 1 fitplot}
+fit_plot(qgam_model_1A, 'seq_num')
+fit_plot(qgam_model_1A, 'minutefs') 
+
+fit_plot(qgam_model_1B, 'seq_num')
+fit_plot(qgam_model_1B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_1A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_1B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</details>
+
+### Linia 2
+```{r linia 2 modele, echo=TRUE, results='hide'}
+qgam_model_2A <- mqgam(delay ~ ti(seq_num, k = 7) + ti(minutefs, k = 7) + ti(seq_num, minutefs), data = df2a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_2A, fun = summary) #hidden because of lenght
+
+qgam_model_2B <- mqgam(delay ~ ti(seq_num, k = 6) + ti(minutefs, k = 8) + ti(seq_num, minutefs), data = df2b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_2B, fun = summary) #hidden because of lenght
+```
+
+```{r linia 2 repsplot}
+resp_plot(qgam_model_2A, type = 'seq_num')
+
+resp_plot(qgam_model_2B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_2A)
+many_median(qgam_model_2B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_2A, 'seq_num') 
+fit_plot(qgam_model_2A, 'minutefs')
+
+fit_plot(qgam_model_2B, 'seq_num') 
+fit_plot(qgam_model_2B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_2A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_2B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 3
+```{r, echo=TRUE, results='hide'}
+qgam_model_3A <- mqgam(delay ~ ti(seq_num, k = 18) + ti(minutefs, k = 8) + ti(seq_num, minutefs), data = df3a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_3A, fun = summary) #hidden because of lenght
+
+qgam_model_3B <- mqgam(delay ~ ti(seq_num, k = 22) + ti(minutefs, k = 8) + ti(seq_num, minutefs), data = df3b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_3B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_3A, type = 'seq_num')
+
+resp_plot(qgam_model_3B, type = 'seq_num') 
+```
+
+
+```{r}
+many_median(qgam_model_3A)
+many_median(qgam_model_3B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_3A, 'seq_num')
+fit_plot(qgam_model_3A, 'minutefs')
+
+fit_plot(qgam_model_3B, 'seq_num')
+fit_plot(qgam_model_3B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_3A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_3B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 4
+```{r, echo=TRUE, results='hide'}
+qgam_model_4A <- mqgam(delay ~ ti(seq_num, k = 28) + ti(minutefs, k = 13) + ti(seq_num, minutefs), data = df4a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_4A, fun = summary) #hidden because of lenght
+
+qgam_model_4B <- mqgam(delay ~ ti(seq_num, k = 28) + ti(minutefs, k = 13) + ti(seq_num, minutefs), data = df4b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_4B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_4A, type = 'seq_num') 
+
+resp_plot(qgam_model_4B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_4A)
+many_median(qgam_model_4B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_4A, 'seq_num') 
+fit_plot(qgam_model_4A, 'minutefs')
+
+fit_plot(qgam_model_4B, 'seq_num') 
+fit_plot(qgam_model_4B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_4A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_4B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+
+### Linia 5
+```{r, echo=TRUE, results='hide'}
+qgam_model_5A <- mqgam(delay ~ ti(seq_num, k = 22, bs = 'cs') + ti(minutefs, k = 14) + ti(seq_num, minutefs), data = df5a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_5A, fun = summary) #hidden because of lenght
+
+qgam_model_5B <- mqgam(delay ~ ti(seq_num, k = 19) + ti(minutefs, k = 14) + ti(seq_num, minutefs), data = df5b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_5B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_5A, type = 'seq_num') 
+
+resp_plot(qgam_model_5B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_5A)
+many_median(qgam_model_5B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_5A, 'seq_num') 
+fit_plot(qgam_model_5A, 'minutefs')
+
+fit_plot(qgam_model_5B, 'seq_num') 
+fit_plot(qgam_model_5B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_5A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_5B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 6
+```{r, echo=TRUE, results='hide'}
+qgam_model_6A <- mqgam(delay ~ ti(seq_num, k = 19) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df6a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_6A, fun = summary) #hidden because of lenght
+
+qgam_model_6B <- mqgam(delay ~ ti(seq_num, k = 19) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df6b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_6B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_6A, type = 'seq_num') 
+
+resp_plot(qgam_model_6B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_6A)
+many_median(qgam_model_6B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_6A, 'seq_num') 
+fit_plot(qgam_model_6A, 'minutefs')
+
+fit_plot(qgam_model_6B, 'seq_num') 
+fit_plot(qgam_model_6B, 'minutefs')
+```
+```{r}
+R1(qgam_model_6A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_6B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 8
+```{r, echo=TRUE, results='hide'}
+qgam_model_8A <- mqgam(delay ~ ti(seq_num, k = 22) + ti(minutefs, k = 14) + ti(seq_num, minutefs), data = df8a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_1A, fun = summary) #hidden because of lenght
+
+qgam_model_8B <- mqgam(delay ~ ti(seq_num, k = 22) + ti(minutefs, k = 14) + ti(seq_num, minutefs), data = df8b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_1B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_8A, type = 'seq_num') 
+
+resp_plot(qgam_model_8B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_8A)
+many_median(qgam_model_8B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_8A, 'seq_num') 
+fit_plot(qgam_model_8A, 'minutefs')
+
+fit_plot(qgam_model_8B, 'seq_num') 
+fit_plot(qgam_model_8B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_8A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_8B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 9
+Pomijam z powodu zbyt dużego odsetka niezarejestrowanych odjazdów.
+
+### Linia 10
+```{r, echo=TRUE, results='hide'}
+qgam_model_10A <- mqgam(delay ~ ti(seq_num, k = 24) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df10a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_10A, fun = summary) #hidden because of lenght
+
+qgam_model_10B <- mqgam(delay ~ ti(seq_num, k = 25) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df10b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_10B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_10A, type = 'seq_num') 
+
+resp_plot(qgam_model_10B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_10A)
+many_median(qgam_model_10B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_10A, 'seq_num') 
+fit_plot(qgam_model_10A, 'minutefs')
+
+fit_plot(qgam_model_10B, 'seq_num') 
+fit_plot(qgam_model_10B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_10A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_10B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 11
+```{r, echo=TRUE, results='hide'}
+qgam_model_11A <- mqgam(delay ~ ti(seq_num, k = 15) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df11a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_11A, fun = summary) #hidden because of lenght
+
+qgam_model_11B <- mqgam(delay ~ ti(seq_num, k = 17) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df11b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_11B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_11A, type = 'seq_num') 
+
+resp_plot(qgam_model_11B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_11A)
+many_median(qgam_model_11B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_11A, 'seq_num') 
+fit_plot(qgam_model_11A, 'minutefs')
+
+fit_plot(qgam_model_11B, 'seq_num') 
+fit_plot(qgam_model_11B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_11A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_11B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 13
+```{r, echo=TRUE, results='hide'}
+qgam_model_13A <- mqgam(delay ~ ti(seq_num, k = 25) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df13a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_13A, fun = summary) #hidden because of lenght
+
+qgam_model_13B <- mqgam(delay ~ ti(seq_num, k = 25) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df13b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_13B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_13A, type = 'seq_num') 
+
+resp_plot(qgam_model_13B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_13A)
+many_median(qgam_model_13B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_13A, 'seq_num') 
+fit_plot(qgam_model_13A, 'minutefs')
+
+fit_plot(qgam_model_13B, 'seq_num') 
+fit_plot(qgam_model_13B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_13A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_13B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 14
+```{r, echo=TRUE, results='hide'}
+qgam_model_14A <- mqgam(delay ~ ti(seq_num, k = 31) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df14a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_14A, fun = summary) #hidden because of lenght
+
+qgam_model_14B <- mqgam(delay ~ ti(seq_num, k = 33) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df14b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_14B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_14A, type = 'seq_num') 
+
+resp_plot(qgam_model_14B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_14A)
+many_median(qgam_model_14B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_14A, 'seq_num') 
+fit_plot(qgam_model_14A, 'minutefs')
+
+fit_plot(qgam_model_14B, 'seq_num') 
+fit_plot(qgam_model_14B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_14A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_14B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 16
+Pomijam z powodu zbyt dużego odsetka niezarejestrowanych odjazdów.
+
+### Linia 18
+```{r, echo=TRUE, results='hide'}
+qgam_model_18A <- mqgam(delay ~ ti(seq_num, k = 23) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df18a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_18A, fun = summary) #hidden because of lenght
+
+qgam_model_18B <- mqgam(delay ~ ti(seq_num, k = 23) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df18b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_18B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_18A, type = 'seq_num') 
+
+resp_plot(qgam_model_18B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_18A)
+many_median(qgam_model_18B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_18A, 'seq_num') 
+fit_plot(qgam_model_18A, 'minutefs')
+
+fit_plot(qgam_model_18B, 'seq_num') 
+fit_plot(qgam_model_18B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_18A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_18B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 19
+```{r, echo=TRUE, results='hide'}
+qgam_model_19A <- mqgam(delay ~ ti(seq_num, k = 17) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df19a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_19A, fun = summary) #hidden because of lenght
+
+qgam_model_19B <- mqgam(delay ~ ti(seq_num, k = 16) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df19b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_19B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_19A, type = 'seq_num') 
+
+resp_plot(qgam_model_19B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_19A)
+many_median(qgam_model_19B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_19A, 'seq_num') 
+fit_plot(qgam_model_19A, 'minutefs')
+
+fit_plot(qgam_model_19B, 'seq_num') 
+fit_plot(qgam_model_19B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_19A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_19B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 20
+```{r, echo=TRUE, results='hide'}
+qgam_model_20A <- mqgam(delay ~ ti(seq_num, k = 16) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df20a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_20A, fun = summary) #hidden because of lenght
+
+qgam_model_20B <- mqgam(delay ~ ti(seq_num, k = 16) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df20b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_20B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_20A, type = 'seq_num') 
+
+resp_plot(qgam_model_20B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_20A)
+many_median(qgam_model_20B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_20A, 'seq_num') 
+fit_plot(qgam_model_20A, 'minutefs')
+
+fit_plot(qgam_model_20B, 'seq_num') 
+fit_plot(qgam_model_20B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_20A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_20B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 21
+Pomijam ze względu na zbyt duży odsetek niezarejestrowanych odjazdów.
+
+### Linia 22
+```{r, echo=TRUE, results='hide'}
+qgam_model_22A <- mqgam(delay ~ ti(seq_num, k = 34) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df22a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_22A, fun = summary) #hidden because of lenght
+
+qgam_model_22B <- mqgam(delay ~ ti(seq_num, k = 34) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df22b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_22B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_22A, type = 'seq_num') 
+
+resp_plot(qgam_model_22B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_22A)
+many_median(qgam_model_22B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_22A, 'seq_num') 
+fit_plot(qgam_model_22A, 'minutefs')
+
+fit_plot(qgam_model_22B, 'seq_num') 
+fit_plot(qgam_model_22B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_22A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_22B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 24
+```{r, echo=TRUE, results='hide'}
+qgam_model_24A <- mqgam(delay ~ ti(seq_num, k = 23) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df24a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_24A, fun = summary) #hidden because of lenght
+
+qgam_model_24B <- mqgam(delay ~ ti(seq_num, k = 25) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df24b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_24B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_24A, type = 'seq_num') 
+
+resp_plot(qgam_model_24B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_24A)
+many_median(qgam_model_24B)
+```
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_24A, 'seq_num') 
+fit_plot(qgam_model_24A, 'minutefs')
+
+fit_plot(qgam_model_24B, 'seq_num') 
+fit_plot(qgam_model_24B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_24A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_24B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 44
+```{r, echo=TRUE, results='hide'}
+qgam_model_44A <- mqgam(delay ~ ti(seq_num, k = 23) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df44a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_44A, fun = summary) #hidden because of lenght
+
+qgam_model_44B <- mqgam(delay ~ ti(seq_num, k = 23) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df44b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_44B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_44A, type = 'seq_num') 
+
+resp_plot(qgam_model_44B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_44A)
+many_median(qgam_model_44B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_44A, 'seq_num') 
+fit_plot(qgam_model_44A, 'minutefs')
+
+fit_plot(qgam_model_44B, 'seq_num') 
+fit_plot(qgam_model_44B, 'minutefs')
+```
+
+```{r}
+R1(qgam_model_44A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_44B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+
+### Linia 50
+```{r, echo=TRUE, results='hide'}
+qgam_model_50A <- mqgam(delay ~ ti(seq_num, k = 15) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df50a, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_50A, fun = summary) #hidden because of lenght
+
+qgam_model_50B <- mqgam(delay ~ ti(seq_num, k = 15) + ti(minutefs, k = 15) + ti(seq_num, minutefs), data = df50b, qu = seq(0.2, 0.9, 0.1))
+qdo(qgam_model_50B, fun = summary) #hidden because of lenght
+```
+
+```{r}
+resp_plot(qgam_model_50A, type = 'seq_num') 
+
+resp_plot(qgam_model_50B, type = 'seq_num')
+```
+
+
+```{r}
+many_median(qgam_model_50A)
+many_median(qgam_model_50B)
+```
+
+<div style="background-color: #e2e2e2;padding: 10px; margin: 5px 10px;">
+#### Diagnostyka
+<details><summary> Rozwiń ▼ </summary>
+```{r}
+fit_plot(qgam_model_50A, 'seq_num') 
+fit_plot(qgam_model_50A, 'minutefs')
+
+fit_plot(qgam_model_50B, 'seq_num') 
+fit_plot(qgam_model_50B, 'minutefs')
+```
+```{r}
+R1(qgam_model_50A) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+R1(qgam_model_50B) %>% t() %>% kable(digits = 2) %>% kable_styling(font_size = 12)
+```
+</div>
+</details>
+
+
+## Co dalej?
+
+Interesujące byłoby porównaie zebranych tutaj danych z innymi. Na przykład:
+
+ - z infomacjami o przepływie pasażerów. Czy jest korelacja pomiędzy ich liczbą, a spóźnienieniami?
+ - z informacjami o zagęszczeniu ruchu. Jak samochody wpływają na tramwaje?
+ - z ustawieniami sygnalizacji. Czy niektórych spóźnień nie dałoby się uniknąć gdyby je zmienić?
+
+
